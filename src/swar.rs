@@ -38,14 +38,9 @@ fn finalize(h: u64) -> u64 {
     h
 }
 
-/// Finds the `;` at or after `pos` and hashes `data[pos..semi]` in the same pass.
-///
-/// Returns `(index_of_semicolon, hash)`.
-///
-/// Reads in 8-byte words, so it may touch up to [`SLACK`] bytes past the `;`. Callers must
-/// only use this where that slack is in bounds; see the scalar tail in the workers.
+/// The word-at-a-time scan, returning the accumulator *before* [`finalize`].
 #[inline]
-pub fn find_semi_and_hash(data: &[u8], pos: usize) -> (usize, u64) {
+fn scan_loop(data: &[u8], pos: usize) -> (usize, u64) {
     let mut h: u64 = 0;
     let mut p = pos;
     loop {
@@ -55,18 +50,30 @@ pub fn find_semi_and_hash(data: &[u8], pos: usize) -> (usize, u64) {
             let idx = (m.trailing_zeros() >> 3) as usize;
             // Keep only the bytes before the ';'. idx == 0 yields a zero mask.
             let mask = (1u64 << (idx * 8)).wrapping_sub(1);
-            return (p + idx, finalize(mix(h, word & mask)));
+            return (p + idx, mix(h, word & mask));
         }
         h = mix(h, word);
         p += 8;
     }
 }
 
+/// Finds the `;` at or after `pos` and hashes `data[pos..semi]` in the same pass.
+///
+/// Returns `(index_of_semicolon, hash)`.
+///
+/// Reads in 8-byte words, so it may touch up to [`SLACK`] bytes past the `;`. Callers must
+/// only use this where that slack is in bounds; see the scalar tail in the workers.
+#[inline]
+pub fn find_semi_and_hash(data: &[u8], pos: usize) -> (usize, u64) {
+    let (semi, h) = scan_loop(data, pos);
+    (semi, finalize(h))
+}
+
 /// Names 16 bytes and over. Out of line so it does not share registers with the hot path.
 #[cold]
 #[inline(never)]
-fn find_semi_and_hash_long(data: &[u8], pos: usize) -> (usize, u64) {
-    find_semi_and_hash(data, pos)
+fn scan_loop_long(data: &[u8], pos: usize) -> (usize, u64) {
+    scan_loop(data, pos)
 }
 
 /// [`find_semi_and_hash`] with the loop replaced by one fixed 16-byte window.
@@ -87,13 +94,31 @@ fn find_semi_and_hash_long(data: &[u8], pos: usize) -> (usize, u64) {
 /// Reads [`FLAT_SLACK`] bytes from `pos` — more than [`SLACK`], and unconditionally.
 #[inline(always)]
 pub fn find_semi_and_hash_flat(data: &[u8], pos: usize) -> (usize, u64) {
+    let (semi, h) = scan_flat(data, pos);
+    (semi, finalize(h))
+}
+
+/// [`find_semi_and_hash_flat`] without the final avalanche.
+///
+/// `mix` ends in a multiply, so the *high* bits of what it returns are already well mixed
+/// and [`finalize`] only buys spread in the low ones. A table that takes its slot from the
+/// high bits does not need it, and skipping it removes five operations from the dependency
+/// chain that ends at the table load. The result is not a general-purpose hash: use it only
+/// where the index comes off the top.
+#[inline(always)]
+pub fn find_semi_and_hash_flat_raw(data: &[u8], pos: usize) -> (usize, u64) {
+    scan_flat(data, pos)
+}
+
+#[inline(always)]
+fn scan_flat(data: &[u8], pos: usize) -> (usize, u64) {
     let w0 = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
     let w1 = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
     let m0 = semi_mask(w0);
     let m1 = semi_mask(w1);
 
     if m0 | m1 == 0 {
-        return find_semi_and_hash_long(data, pos);
+        return scan_loop_long(data, pos);
     }
 
     // `trailing_zeros` is 64 on a zero mask, so this is 8 exactly when word 0 holds no `;`.
@@ -112,7 +137,7 @@ pub fn find_semi_and_hash_flat(data: &[u8], pos: usize) -> (usize, u64) {
     let prev = if short { 0 } else { mix(0, w0) };
     let last = if short { w0 } else { w1 } & keep;
 
-    (pos + len, finalize(mix(prev, last)))
+    (pos + len, mix(prev, last))
 }
 
 /// Byte-at-a-time equivalent, for the end of the file where the wide load would run off
@@ -228,10 +253,43 @@ mod tests {
         let hashes: HashSet<u64> =
             STATIONS.iter().map(|(n, _)| find_semi_and_hash(&line(n), 0).1).collect();
         assert_eq!(hashes.len(), STATIONS.len());
+    }
 
-        let buckets: HashSet<u64> =
-            STATIONS.iter().map(|(n, _)| find_semi_and_hash(&line(n), 0).1 & 0xFFFF).collect();
-        assert!(buckets.len() > 400, "poor low-bit spread: {}", buckets.len());
+    /// The table takes its slot from the *high* bits, so that is where the spread has to be.
+    /// `find_semi_and_hash_flat_raw` skips the avalanche and relies on this being true of a
+    /// bare multiply — the assertion is the whole justification for dropping it, so it has to
+    /// hold over more than this dataset. Two name sets: the 413 official ones, and 10,000
+    /// synthetic ones sharing a long prefix, which is the shape the spec permits and the one
+    /// most likely to defeat a hash that only mixes upward. Bit widths run to 18 because the
+    /// table doubles on demand and 10,000 names reach 2^15.
+    #[test]
+    fn high_bits_spread_across_every_table_size() {
+        let official: Vec<String> = STATIONS.iter().map(|(n, _)| n.to_string()).collect();
+        let adversarial: Vec<String> =
+            (0..10_000).map(|i| format!("Sankt_Peterburg_Oblast_{i:05}")).collect();
+
+        for (names, set) in [(&official, "official"), (&adversarial, "prefixed")] {
+            for bits in 11..=18u32 {
+                let slots = 1usize << bits;
+                for (label, hash) in [
+                    ("finalized", find_semi_and_hash as fn(&[u8], usize) -> (usize, u64)),
+                    ("raw", find_semi_and_hash_flat_raw),
+                ] {
+                    let buckets: HashSet<u64> =
+                        names.iter().map(|n| hash(&line(n), 0).1 >> (64 - bits)).collect();
+                    // n names into `slots` buckets collide ~n^2/(2*slots) times by chance.
+                    // Allow twice that and a floor of 5 for the small-n cases.
+                    let expected = names.len().pow(2) / (2 * slots);
+                    let floor = names.len().saturating_sub(2 * expected + 5);
+                    assert!(
+                        buckets.len() >= floor,
+                        "{set}/{label} at {bits} bits: {} slots for {} names, wanted {floor}",
+                        buckets.len(),
+                        names.len(),
+                    );
+                }
+            }
+        }
     }
 
     /// Names differing only past the first 8 bytes must hash differently, or the table

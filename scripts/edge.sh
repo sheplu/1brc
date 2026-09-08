@@ -8,7 +8,8 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 bins=("$@")
 [ ${#bins[@]} -eq 0 ] &&
-    bins=(v2_mmap v3_hash v4_simd v5_branchless v6_inline v7_pipelined v8_pread v9_flatscan)
+    bins=(v2_mmap v3_hash v4_simd v5_branchless v6_inline v7_pipelined v8_pread v9_flatscan
+        v10_rawhash)
 
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT

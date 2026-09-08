@@ -8,10 +8,12 @@ v6_inline t8	OBRC_THREADS=8 ./target/release/v6_inline measurements.txt
 v7_pipelined t8	OBRC_THREADS=8 ./target/release/v7_pipelined measurements.txt
 v8_pread t8	OBRC_THREADS=8 ./target/release/v8_pread measurements.txt
 v9_flatscan t8	OBRC_THREADS=8 ./target/release/v9_flatscan measurements.txt
+v10_rawhash t8	OBRC_THREADS=8 ./target/release/v10_rawhash measurements.txt
 # The headline, 18 threads.
 v7_pipelined t18	OBRC_THREADS=18 ./target/release/v7_pipelined measurements.txt
 v8_pread t18	OBRC_THREADS=18 ./target/release/v8_pread measurements.txt
 v9_flatscan t18	OBRC_THREADS=18 ./target/release/v9_flatscan measurements.txt
+v10_rawhash t18	OBRC_THREADS=18 ./target/release/v10_rawhash measurements.txt
 # I/O floor, both readers, both thread counts.
 io mmap t8	OBRC_THREADS=8 ./target/release/io_floor mmap measurements.txt
 io pread t8	OBRC_THREADS=8 ./target/release/io_floor pread measurements.txt
@@ -25,12 +27,15 @@ hf mmap parse4 t8	OBRC_THREADS=8 OBRC_READER=mmap ./target/release/hot_floor par
 hf mmap hash t8	OBRC_THREADS=8 OBRC_READER=mmap ./target/release/hot_floor hash measurements.txt
 hf mmap nocmp t8	OBRC_THREADS=8 OBRC_READER=mmap ./target/release/hot_floor nocmp measurements.txt
 hf mmap table t8	OBRC_THREADS=8 OBRC_READER=mmap ./target/release/hot_floor table measurements.txt
-# Ablation under pread + the inline table: v8/v9's actual engine.
+# Ablation under pread + the inline table: v8/v9/v10's actual engine. Table size held at the
+# hot_floor default of 2^16 throughout, so the only variable between rows is the stage.
 hf pread touch t18	OBRC_THREADS=18 ./target/release/hot_floor touch measurements.txt
 hf pread parse t18	OBRC_THREADS=18 ./target/release/hot_floor parse measurements.txt
 hf pread hash t18	OBRC_THREADS=18 ./target/release/hot_floor hash measurements.txt
 hf pread fhash t18	OBRC_THREADS=18 ./target/release/hot_floor fhash measurements.txt
 hf pread itable t18	OBRC_THREADS=18 ./target/release/hot_floor itable measurements.txt
 hf pread flat t18	OBRC_THREADS=18 ./target/release/hot_floor flat measurements.txt
+hf pread raw t18	OBRC_THREADS=18 ./target/release/hot_floor raw measurements.txt
 hf pread itable3 t18	OBRC_THREADS=18 ./target/release/hot_floor itable3 measurements.txt
 hf pread flat3 t18	OBRC_THREADS=18 ./target/release/hot_floor flat3 measurements.txt
+hf pread raw3 t18	OBRC_THREADS=18 ./target/release/hot_floor raw3 measurements.txt

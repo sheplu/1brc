@@ -34,12 +34,18 @@ use std::time::Instant;
 use obrc::chunk::{chunk_bounds, local_bounds, num_chunks, split_streams, CHUNK_SIZE};
 use obrc::inline_table::{InlineTable, KEY_SLACK};
 use obrc::parse::parse_temp_branchless;
-use obrc::swar::{find_semi_and_hash, find_semi_and_hash_flat, FLAT_SLACK};
+use obrc::swar::{
+    find_semi_and_hash, find_semi_and_hash_flat, find_semi_and_hash_flat_raw, FLAT_SLACK,
+};
 use obrc::sys::{set_thread_qos_user_interactive, Mapping};
 use obrc::table::Table;
 use obrc::MAX_LINE_LEN;
 
-const TABLE_BITS: u32 = 16;
+/// Slots per table, as a power of two. Overridable with `OBRC_TABLE_BITS` because the size
+/// is itself a thing under test: 16 is 4 MiB per thread, which holds 413 live entries
+/// scattered over more 16 KB pages than the L1 dTLB can map. [`InlineTable`] grows on
+/// demand, so a small value here is a cache-behaviour choice and not a capacity limit.
+const DEFAULT_TABLE_BITS: u32 = 16;
 
 /// Read past the chunk so the line straddling its end can be finished locally, as in v8.
 const OVERLAP: usize = MAX_LINE_LEN;
@@ -107,6 +113,16 @@ fn full_inline(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize)
 #[inline(always)]
 fn full_flat(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
     let (semi, h) = find_semi_and_hash_flat(data, pos);
+    let (v, next) = parse_temp_branchless(data, semi + 1);
+    table.upsert(data, pos, semi - pos, h, v);
+    (h, next)
+}
+
+/// [`full_flat`] with the hash's final avalanche dropped. Same rows, different hash, so the
+/// sink differs from `flat` by design — the entry count is what has to match.
+#[inline(always)]
+fn full_raw(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
+    let (semi, h) = find_semi_and_hash_flat_raw(data, pos);
     let (v, next) = parse_temp_branchless(data, semi + 1);
     table.upsert(data, pos, semi - pos, h, v);
     (h, next)
@@ -197,14 +213,14 @@ struct State {
 }
 
 impl State {
-    fn new(mode: &str) -> Self {
+    fn new(mode: &str, bits: u32) -> Self {
         let offset_bits = match mode {
             m if m.starts_with("itable") => 0,
-            m if m.starts_with("table") || m.starts_with("split") || m == "nocmp" => TABLE_BITS,
+            m if m.starts_with("table") || m.starts_with("split") || m == "nocmp" => bits,
             _ => 0,
         };
         let inline_bits =
-            if mode.starts_with("itable") || mode.starts_with("flat") { TABLE_BITS } else { 0 };
+            if ["itable", "flat", "raw"].iter().any(|p| mode.starts_with(p)) { bits } else { 0 };
         let split_n = match mode {
             "split2" => 2,
             "split4" => 4,
@@ -214,7 +230,7 @@ impl State {
         State {
             table: Table::new(offset_bits),
             itable: InlineTable::new(inline_bits),
-            split: (0..split_n).map(|_| Table::new(TABLE_BITS)).collect(),
+            split: (0..split_n).map(|_| Table::new(bits)).collect(),
             acc: 0,
             n: 0,
         }
@@ -282,6 +298,14 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
                 *n += 1;
             }
         }
+        "raw" => {
+            while pos < end {
+                let (h, next) = full_raw(data, itable, pos);
+                *acc ^= h;
+                pos = next;
+                *n += 1;
+            }
+        }
         "parse2" => streamed::<2>(data, pos, end, acc, n, parse_only),
         "parse3" => streamed::<3>(data, pos, end, acc, n, parse_only),
         "parse4" => streamed::<4>(data, pos, end, acc, n, parse_only),
@@ -299,6 +323,9 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
         "flat2" => streamed::<2>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
         "flat3" => streamed::<3>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
         "flat4" => streamed::<4>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
+        "raw2" => streamed::<2>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
+        "raw3" => streamed::<3>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
+        "raw4" => streamed::<4>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
         "nocmp" => {
             while pos < end {
                 let (semi, h) = find_semi_and_hash(data, pos);
@@ -318,9 +345,9 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
 
 /// Walks the mapping directly. The last [`TAIL_GUARD`] bytes are skipped, because the wide
 /// paths would read off the end of it.
-fn worker_mmap(mode: &str, data: &[u8], total: usize, cursor: &AtomicUsize) -> State {
+fn worker_mmap(mode: &str, bits: u32, data: &[u8], total: usize, cursor: &AtomicUsize) -> State {
     set_thread_qos_user_interactive();
-    let mut st = State::new(mode);
+    let mut st = State::new(mode, bits);
     let wide_limit = data.len().saturating_sub(TAIL_GUARD);
 
     loop {
@@ -339,9 +366,16 @@ fn worker_mmap(mode: &str, data: &[u8], total: usize, cursor: &AtomicUsize) -> S
 
 /// v8's reader: one recycled buffer per thread, `pread` per chunk. The buffer's slack past
 /// EOF is what lets the wide paths cover the whole file with no scalar tail.
-fn worker_pread(mode: &str, file: &File, len: usize, total: usize, cursor: &AtomicUsize) -> State {
+fn worker_pread(
+    mode: &str,
+    bits: u32,
+    file: &File,
+    len: usize,
+    total: usize,
+    cursor: &AtomicUsize,
+) -> State {
     set_thread_qos_user_interactive();
-    let mut st = State::new(mode);
+    let mut st = State::new(mode, bits);
     let mut buf = vec![0u8; CHUNK_SIZE + OVERLAP + TAIL_GUARD];
 
     loop {
@@ -370,6 +404,11 @@ fn main() {
     let threads =
         env::var("OBRC_THREADS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8);
     let reader = env::var("OBRC_READER").unwrap_or_else(|_| "pread".to_string());
+    let bits = env::var("OBRC_TABLE_BITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&b| b <= 24)
+        .unwrap_or(DEFAULT_TABLE_BITS);
 
     // An `Entry` in the offset-keyed table points into `data`, which under `pread` is a
     // buffer recycled every chunk. The previous chunk's keys become garbage, so every
@@ -397,14 +436,14 @@ fn main() {
             let data = mapping.as_slice();
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads)
-                    .map(|_| scope.spawn(|| worker_mmap(&mode, data, total, &cursor)))
+                    .map(|_| scope.spawn(|| worker_mmap(&mode, bits, data, total, &cursor)))
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         }
         "pread" => std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
-                .map(|_| scope.spawn(|| worker_pread(&mode, &file, len, total, &cursor)))
+                .map(|_| scope.spawn(|| worker_pread(&mode, bits, &file, len, total, &cursor)))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         }),
@@ -426,8 +465,8 @@ fn main() {
     }
 
     eprintln!(
-        "{mode:>8} {reader:>5}  {threads} threads  {secs:.3} s  {:.1} GB/s  {:.2} ns/row  \
-         ({rows} rows, sink {sink:016x}, {distinct} entries)",
+        "{mode:>8} {reader:>5} b{bits:<2} {threads} threads  {secs:.3} s  {:.1} GB/s  \
+         {:.2} ns/row  ({rows} rows, sink {sink:016x}, {distinct} entries)",
         len as f64 / secs / 1e9,
         secs * 1e9 / rows.max(1) as f64 * threads as f64,
     );
