@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Hand-built inputs that the generated dataset never produces, run against the v1 oracle.
 #
-#   scripts/edge.sh              # every version
-#   scripts/edge.sh v8_pread     # just one
+#   scripts/edge.sh                # every version
+#   scripts/edge.sh v9_flatscan    # just one
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 bins=("$@")
-[ ${#bins[@]} -eq 0 ] && bins=(v2_mmap v3_hash v4_simd v5_branchless v6_inline v7_pipelined v8_pread)
+[ ${#bins[@]} -eq 0 ] &&
+    bins=(v2_mmap v3_hash v4_simd v5_branchless v6_inline v7_pipelined v8_pread v9_flatscan)
 
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
