@@ -9,11 +9,13 @@ v7_pipelined t8	OBRC_THREADS=8 ./target/release/v7_pipelined measurements.txt
 v8_pread t8	OBRC_THREADS=8 ./target/release/v8_pread measurements.txt
 v9_flatscan t8	OBRC_THREADS=8 ./target/release/v9_flatscan measurements.txt
 v10_rawhash t8	OBRC_THREADS=8 ./target/release/v10_rawhash measurements.txt
+v11_keyed t8	OBRC_THREADS=8 ./target/release/v11_keyed measurements.txt
 # The headline, 18 threads.
 v7_pipelined t18	OBRC_THREADS=18 ./target/release/v7_pipelined measurements.txt
 v8_pread t18	OBRC_THREADS=18 ./target/release/v8_pread measurements.txt
 v9_flatscan t18	OBRC_THREADS=18 ./target/release/v9_flatscan measurements.txt
 v10_rawhash t18	OBRC_THREADS=18 ./target/release/v10_rawhash measurements.txt
+v11_keyed t18	OBRC_THREADS=18 ./target/release/v11_keyed measurements.txt
 # I/O floor, both readers, both thread counts.
 io mmap t8	OBRC_THREADS=8 ./target/release/io_floor mmap measurements.txt
 io pread t8	OBRC_THREADS=8 ./target/release/io_floor pread measurements.txt
@@ -36,6 +38,8 @@ hf pread fhash t18	OBRC_THREADS=18 ./target/release/hot_floor fhash measurements
 hf pread itable t18	OBRC_THREADS=18 ./target/release/hot_floor itable measurements.txt
 hf pread flat t18	OBRC_THREADS=18 ./target/release/hot_floor flat measurements.txt
 hf pread raw t18	OBRC_THREADS=18 ./target/release/hot_floor raw measurements.txt
+hf pread keyed t18	OBRC_THREADS=18 ./target/release/hot_floor keyed measurements.txt
 hf pread itable3 t18	OBRC_THREADS=18 ./target/release/hot_floor itable3 measurements.txt
 hf pread flat3 t18	OBRC_THREADS=18 ./target/release/hot_floor flat3 measurements.txt
 hf pread raw3 t18	OBRC_THREADS=18 ./target/release/hot_floor raw3 measurements.txt
+hf pread keyed3 t18	OBRC_THREADS=18 ./target/release/hot_floor keyed3 measurements.txt

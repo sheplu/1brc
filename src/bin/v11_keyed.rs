@@ -1,42 +1,44 @@
-//! v10: v9, with the hash's final avalanche deleted. The smallest shipped win here, and the
-//! one whose planned justification turned out to be wrong.
+//! v11: the table's probe key is taken from the scan instead of re-read from memory.
 //!
-//! **What works.** [`find_semi_and_hash_flat`](obrc::swar::find_semi_and_hash_flat) ends in
-//! `h ^= h>>32; h *= K; h ^= h>>32` — five operations, strictly serial, sitting between the
-//! last `mix` and the table load. Nothing in the row can proceed until the slot index is
-//! known, so they cost their full latency. They exist to spread the *low* bits, because the
-//! low bits of a multiply are barely mixed: bit 0 of a product is just the product of the
-//! inputs' bit 0s. [`InlineTable`] now takes its slot off the *top* of the hash instead, and
-//! the top of a multiply is already well mixed, so the avalanche buys nothing the table uses.
+//! **The observation.** Disassembling v10's inner loop turns up ~135 instructions per row,
+//! against a measured ~17 cycles per row per thread — so at Apple's issue width the loop is
+//! *instruction-throughput* bound, not latency bound. Roughly half those instructions are not
+//! the algorithm. The largest single block is the probe key: `probe_key` loads the name's 32
+//! bytes as two `u128`s, indexes a mask table twice, and `and`s — four loads, two `adrp`/`add`
+//! address computations, two mask loads and four masks — and then, because a 32-byte key plus
+//! three interleaved row states will not fit in the register file, LLVM spills the key to the
+//! stack and reloads it four instructions later for the compare.
 //!
-//! Worth 2–4% of the hot loop, holding at every table size and thread count tested — in the
-//! current batch of record `flat` → `raw` is 582 → 557 ms and `flat3` → `raw3` 533 → 511. That
-//! part reproduces. The whole-binary gap does not: the same batch puts v9 → v10 at **984 → 946 ms
-//! at 8 threads and 556 → 535 at 18**, but across batches it has come out anywhere from 0.3% to
-//! 6%, so believe the engine number and treat the wall clock as consistent with it, not as
-//! evidence.
+//! **The change.** All of that recomputes bytes the scan is already holding.
+//! [`scan_flat_keyed`] loads the name's first 16 bytes and masks off everything at and past the
+//! `;` — it has to, or the trailing garbage would reach the hash. For any name that fits its
+//! window, that masked pair *is* the probe key: `probe_key` keeps the low `len` bytes of the
+//! same 16 and zeroes the rest, and its high `u128` is `MASK[0]`, which is zero. So the scan
+//! hands the two words back and
+//! [`upsert_words`](InlineTable::upsert_words) starts its compare with both operands already
+//! in registers. One select replaces four loads, two mask lookups, four `and`s and a spill
+//! pair.
 //!
-//! **What does not.** The plan going in was that 2^16 slots — 4 MiB per thread for 413 live
-//! entries — thrashes the L1 dTLB, and that shrinking to 2^11 (128 KB, permanently mapped)
-//! would be worth 40–70 ms. It is worth nothing. 2^11 is 6% *worse* and 2^12 is 2% worse,
-//! because each extra probe is another dependent load and a low load factor buys more probes
-//! than it saves TLB walks; from 2^13 to 2^16 the whole-binary time is flat inside 4 ms.
-//! The default is 2^14 for the memory — 18 MiB of tables at 18 threads instead of 72 — and
-//! not for the speed, which it does not change.
+//! Knowing the name is under 16 bytes then collapses the probe a second time. That length
+//! guarantees a zero byte inside the first 16, which no stored name of 16 bytes or more has
+//! and no empty slot lacks — so the key's *low* half alone separates the query from every
+//! entry the table can hold. The high half, the length check and the long-name comparison all
+//! drop out, and the probe reads one `ldp` off the entry's line instead of two.
 //!
-//! An intermediate batch did show the size winning 2.3%, and a thread sweep showed the
-//! v9→v10 gap widening from 0.1% at 6 threads to 6.1% at 18. Both evaporated at higher rep
-//! counts. That is the house rule doing its job on the house: a 2% effect on this machine is
-//! not distinguishable from drift, and a *trend* assembled from six such effects is not
-//! either.
+//! Names of 16 bytes and over do not fit the window, so their length is not known there and
+//! neither is their key. They take [`step_long`], which is v10's row verbatim; the branch is
+//! the same ~33:1 one v9 already relied on, and it predicts.
 //!
-//! Shrinking the table at all is only safe because [`InlineTable`] grows on demand. v9 would
-//! have aborted on more distinct names than it had slots; this cannot, at any `bits`.
+//! Everything else is v10: `pread` into a recycled per-thread buffer, the fixed 16-byte `;`
+//! window, no final avalanche, three interleaved line streams, a table that grows on demand.
 //!
-//! Everything else is v9: the fixed-window `;` scan, `pread` into a recycled per-thread
-//! buffer, three interleaved line streams.
+//! **What it bought.** The hot row goes from ~148 instructions to ~96 and no longer spills. One
+//! interleaved batch, 1e9 rows: 535 ms → **463 ms** at 18 threads (−13.5%), 946 → **784** at 8
+//! (−17.1%). In `hot_floor` under `pread`, `raw3` → `keyed3` is 511 → 440 ms — 71 ms, which is 26%
+//! of all compute above the 237 ms read floor and the largest single win in the project measured
+//! that way.
 //!
-//! Usage: v10_rawhash [path]   (OBRC_THREADS, default 8; OBRC_TABLE_BITS, default 14)
+//! Usage: v11_keyed [path]   (OBRC_THREADS, default 8; OBRC_TABLE_BITS, default 14)
 
 use std::collections::BTreeMap;
 use std::env;
@@ -49,30 +51,40 @@ use obrc::chunk::{local_bounds, num_chunks, split_streams, CHUNK_SIZE};
 use obrc::inline_table::{InlineTable, KEY_SLACK};
 use obrc::output::{write_results, Stats};
 use obrc::parse::parse_temp_branchless;
-use obrc::swar::{find_semi_and_hash_flat_raw, FLAT_SLACK};
+use obrc::swar::{find_semi_and_hash_flat_raw, scan_flat_keyed, FLAT_SLACK};
 use obrc::sys::set_thread_qos_user_interactive;
 use obrc::MAX_LINE_LEN;
 
-/// 2^14 slots, 1 MiB per thread. A floor, not a capacity — the table doubles on demand.
-/// Chosen for footprint: 2^13..2^16 all measure the same, and below that probing costs.
+/// See v10: 2^13..2^16 all measure the same, and this is the smallest of them.
 const DEFAULT_TABLE_BITS: u32 = 14;
 
 /// Same as v7 — see the note there on why 4 and above lose.
 const STREAMS: usize = 3;
 
-/// Read past the chunk so the line straddling its end can be finished locally. A worker
-/// never sees another worker's bytes, so this overlap is the only way it can agree with its
-/// neighbour on where the boundary line belongs.
+/// Read past the chunk so the line straddling its end can be finished locally.
 const OVERLAP: usize = MAX_LINE_LEN;
 
 /// Slack past the read that the wide path may touch: the flat scan reads a 16-byte window
-/// from the name start, the parser loads 8 bytes, and the inline probe reads 32.
+/// from the name start, the parser loads 8 bytes, and the cold path's inline probe reads 32.
 const TAIL_GUARD: usize = MAX_LINE_LEN + FLAT_SLACK;
 const _: () = assert!(TAIL_GUARD >= KEY_SLACK);
 
 /// Consumes the line at `pos` and returns the start of the next one.
 #[inline(always)]
 fn step(buf: &[u8], table: &mut InlineTable, pos: usize) -> usize {
+    let Some((semi, hash, klo, khi)) = scan_flat_keyed(buf, pos) else {
+        return step_long(buf, table, pos);
+    };
+    let (value, next) = parse_temp_branchless(buf, semi + 1);
+    table.upsert_words(buf, pos, semi - pos, hash, value, klo, khi);
+    next
+}
+
+/// A name of 16 bytes or more: v10's row, out of line so it shares no registers with the hot
+/// path. 2.9% of the official station list and none of this dataset's common names.
+#[cold]
+#[inline(never)]
+fn step_long(buf: &[u8], table: &mut InlineTable, pos: usize) -> usize {
     let (semi, hash) = find_semi_and_hash_flat_raw(buf, pos);
     let (value, next) = parse_temp_branchless(buf, semi + 1);
     table.upsert(buf, pos, semi - pos, hash, value);
@@ -89,8 +101,6 @@ fn worker(
 ) -> InlineTable {
     set_thread_qos_user_interactive();
     let mut table = InlineTable::new(bits);
-    // Allocated once and reused. Bytes past what `pread` returns are stale, never consumed:
-    // every row ends at or before `end`, and the over-reads past a row are masked off.
     let mut buf = vec![0u8; chunk + OVERLAP + TAIL_GUARD];
 
     loop {
@@ -139,15 +149,12 @@ fn main() {
     let threads =
         env::var("OBRC_THREADS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8);
 
-    // See v9 for the sweep behind this: syscall count dominates, and it is flat past 1 MiB.
     let chunk = env::var("OBRC_CHUNK")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > MAX_LINE_LEN)
         .unwrap_or(CHUNK_SIZE);
 
-    // Exposed because the size turned out to trade two costs against each other rather than
-    // just one, and the knob is how that was found. See the module note.
     let bits = env::var("OBRC_TABLE_BITS")
         .ok()
         .and_then(|s| s.parse().ok())

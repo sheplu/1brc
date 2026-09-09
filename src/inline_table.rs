@@ -35,16 +35,19 @@ pub const KEY_SLACK: usize = INLINE_KEY;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 pub struct Entry {
-    /// The name's first [`INLINE_KEY`] bytes, zero beyond `len`.
+    /// The name's first [`INLINE_KEY`] bytes, zero beyond `len`. All-zero means the slot is
+    /// empty — see [`upsert`](InlineTable::upsert) for why no real name can look like that.
     key: [u128; 2],
+    /// `sum`..`max` are the only fields a repeat row touches, so they are kept adjacent and
+    /// 16-byte aligned: the accumulate is then one load pair and one store pair, not four of
+    /// each scattered across the line.
     sum: i64,
-    /// Where the owned copy of the name starts in the table's key arena.
-    key_off: u32,
     count: u32,
-    /// Doubles as the occupancy flag: names are at least 1 byte, so 0 means empty.
-    len: u32,
     min: i16,
     max: i16,
+    /// Where the owned copy of the name starts in the table's key arena.
+    key_off: u32,
+    len: u32,
     /// Only [`grow`](InlineTable::grow) reads this, to re-slot the entry without having to
     /// re-hash a name it would first have to reassemble. The other 56 bytes leave exactly
     /// this much padding in the cache line, so carrying it is free.
@@ -59,10 +62,20 @@ const _: () = assert!(core::mem::size_of::<Entry>() == 64);
 /// slack in bounds. Masking rather than branching on the length keeps this off the critical
 /// path: both halves are independent of the hash and of each other.
 #[inline(always)]
-fn probe_key(data: &[u8], off: usize, len: usize) -> [u128; 2] {
+pub fn probe_key(data: &[u8], off: usize, len: usize) -> [u128; 2] {
     let lo = u128::from_le_bytes(data[off..off + 16].try_into().unwrap());
     let hi = u128::from_le_bytes(data[off + 16..off + 32].try_into().unwrap());
     [lo & MASK[len.min(16)], hi & MASK[len.saturating_sub(16).min(16)]]
+}
+
+/// [`probe_key`] for a name whose 16-byte window is already masked, as two little-endian
+/// words — the shape [`scan_flat_keyed`](crate::swar::scan_flat_keyed) hands back.
+///
+/// Only correct for `len <= 16`, which is exactly why the high half is zero: `probe_key`
+/// would index `MASK[len - 16]`, and that is `MASK[0]`.
+#[inline(always)]
+pub fn key_from_words(lo: u64, hi: u64) -> [u128; 2] {
+    [(lo as u128) | ((hi as u128) << 64), 0]
 }
 
 pub struct InlineTable {
@@ -138,7 +151,25 @@ impl InlineTable {
     /// [`KEY_SLACK`] bytes from `off` must be readable.
     ///
     /// A hash match is never taken as a key match: the full name is always compared.
-    #[inline]
+    ///
+    /// **Why the length is not compared, and why the slot needs no occupancy flag.** Station
+    /// names hold no NUL, so a name of `len <= INLINE_KEY` zero-padded to [`INLINE_KEY`] bytes
+    /// determines both the bytes and the length: a shorter name has a zero where a longer one
+    /// has a name byte, and a name too long to fit inline fills all 32 with non-zero. The key
+    /// alone therefore settles the match for every name this dataset contains, and only two
+    /// names sharing a 32-byte prefix need `len` — which is exactly when `tail_eq` runs anyway.
+    /// The same argument makes an all-zero key impossible for a live entry, so `Default` marks
+    /// an empty slot and the hot compare rejects it for free. Together that removes a load and
+    /// two compares from in front of the accumulate.
+    ///
+    /// `#[inline(always)]`, with the insert outlined to keep this small enough to deserve it.
+    /// Under a plain `#[inline]` the whole body sat right at LLVM's size threshold, so whether
+    /// it inlined depended on how much budget the caller had already spent: v8, v9 and v10 all
+    /// shipped an out-of-line `bl` here on *every row*, and in `hot_floor` some ablation modes
+    /// inlined it and others did not purely by position in the `match`. A call in the middle of
+    /// the row body also stops the scan for row `i+1` from overlapping the probe for row `i`,
+    /// which is the entire point of `split_streams`.
+    #[inline(always)]
     pub fn upsert(&mut self, data: &[u8], off: usize, len: usize, hash: u64, value: i16) {
         debug_assert!(len > 0 && len <= 100);
         let key = probe_key(data, off, len);
@@ -147,24 +178,154 @@ impl InlineTable {
         // Probe read-only so the arena stays borrowable for the long-name comparison.
         loop {
             let e = &self.entries[idx];
-            if e.len == 0 {
+            if e.key == key {
+                if len <= INLINE_KEY
+                    || (e.len as usize == len
+                        && tail_eq(&self.keys, e.key_off as usize, data, off, len))
+                {
+                    let e = &mut self.entries[idx];
+                    e.sum += value as i64;
+                    e.count += 1;
+                    // Extending the range is logarithmic in the row count — a few dozen times
+                    // per station per thread against 134k rows — so this is a branch that
+                    // predicts, and taking it out of line leaves the common row with a plain
+                    // load and no store. Writing it as one sign test lets the two bounds be
+                    // checked with a single branch.
+                    if ((value as i32 - e.min as i32) | (e.max as i32 - value as i32)) < 0 {
+                        widen(e, value);
+                    }
+                    return;
+                }
+            } else if e.key == [0; 2] {
                 break;
-            }
-            if e.len as usize == len
-                && e.key == key
-                && (len <= INLINE_KEY || tail_eq(&self.keys, e.key_off as usize, data, off, len))
-            {
-                let e = &mut self.entries[idx];
-                e.sum += value as i64;
-                e.count += 1;
-                e.min = e.min.min(value);
-                e.max = e.max.max(value);
-                return;
             }
             idx = (idx + 1) & self.mask;
         }
 
-        // Cold: at most once per distinct station.
+        self.insert(data, off, len, hash, value, key, idx);
+    }
+
+    /// [`upsert`](Self::upsert) for a name shorter than 16 bytes whose zero-padded window the
+    /// caller already holds, as the two words
+    /// [`scan_flat_keyed`](crate::swar::scan_flat_keyed) returns.
+    ///
+    /// Under that length bound the probe collapses twice over. The key needs no rebuilding
+    /// from memory — the scan masked those same bytes to keep them out of the hash, so
+    /// [`key_from_words`] is a relabelling. And only its *low* half has to be compared: a
+    /// name of fewer than 16 bytes has a zero at index `len`, every stored name of 16 or more
+    /// has none in its first 16 bytes, and an empty slot is all zeros — so the low half alone
+    /// separates the query from every entry the table can hold, live or empty, at any length.
+    /// The high half, the length, and the long-name tail compare all drop out, and with them
+    /// the second `ldp` off the entry's cache line.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_words(
+        &mut self,
+        data: &[u8],
+        off: usize,
+        len: usize,
+        hash: u64,
+        value: i16,
+        klo: u64,
+        khi: u64,
+    ) {
+        debug_assert!(len > 0 && len < 16);
+        debug_assert_eq!(key_from_words(klo, khi), probe_key(data, off, len));
+        let key_lo = (klo as u128) | ((khi as u128) << 64);
+        let mut idx = slot(hash, self.shift);
+
+        loop {
+            let e = &self.entries[idx];
+            if e.key[0] == key_lo {
+                let e = &mut self.entries[idx];
+                e.sum += value as i64;
+                e.count += 1;
+                if ((value as i32 - e.min as i32) | (e.max as i32 - value as i32)) < 0 {
+                    widen(e, value);
+                }
+                return;
+            }
+            if e.key[0] == 0 {
+                break;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+
+        // Rebuilt rather than handed over: `insert` takes the key by value, so passing it
+        // costs a 32-byte stack write that the hot path executed and then never read.
+        self.insert(data, off, len, hash, value, [key_lo, 0], idx);
+    }
+
+    /// [`upsert`](Self::upsert) with the key dropped entirely — no [`probe_key`], no compare,
+    /// slots matched on length alone. Ablation only: distinct names of equal length merge, so
+    /// the results are wrong. Prices everything the key costs, the two masked loads included.
+    ///
+    /// With no key there is no all-zero-key sentinel either, so occupancy falls back to `len`.
+    /// The accumulate is `upsert`'s, [`widen`] included — otherwise the difference between the
+    /// two would price the store-free common path as well as the key.
+    #[inline(always)]
+    pub fn upsert_no_key(&mut self, data: &[u8], off: usize, len: usize, hash: u64, value: i16) {
+        let mut idx = slot(hash, self.shift);
+        loop {
+            let e = &mut self.entries[idx];
+            if e.len == 0 {
+                break;
+            }
+            if e.len as usize == len {
+                e.sum += value as i64;
+                e.count += 1;
+                if ((value as i32 - e.min as i32) | (e.max as i32 - value as i32)) < 0 {
+                    widen(e, value);
+                }
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+        self.insert(data, off, len, hash, value, [0; 2], idx);
+    }
+
+    /// [`upsert`](Self::upsert) with the four-field accumulate dropped. Ablation only: it probes
+    /// and compares exactly as the real one does, then throws the measurement away, so it prices
+    /// the read-modify-write against a slot the probe has already pulled into L1.
+    ///
+    /// "Exactly as the real one does" is load-bearing and easy to lose: this body has to track
+    /// `upsert`'s probe line for line, or the difference between them prices the probe too.
+    #[inline(always)]
+    pub fn upsert_no_stats(&mut self, data: &[u8], off: usize, len: usize, hash: u64, value: i16) {
+        let key = probe_key(data, off, len);
+        let mut idx = slot(hash, self.shift);
+        loop {
+            let e = &self.entries[idx];
+            if e.key == key {
+                if len <= INLINE_KEY
+                    || (e.len as usize == len
+                        && tail_eq(&self.keys, e.key_off as usize, data, off, len))
+                {
+                    return;
+                }
+            } else if e.key == [0; 2] {
+                break;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+        self.insert(data, off, len, hash, value, key, idx);
+    }
+
+    /// Claims the empty slot the probe stopped on. At most once per distinct station, so it is
+    /// outlined: its cost is irrelevant and its size is not.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        data: &[u8],
+        off: usize,
+        len: usize,
+        hash: u64,
+        value: i16,
+        key: [u128; 2],
+        idx: usize,
+    ) {
         let key_off = self.keys.len() as u32;
         self.keys.extend_from_slice(&data[off..off + len]);
         self.entries[idx] = Entry {
@@ -179,7 +340,7 @@ impl InlineTable {
         };
         self.used += 1;
         // Growing here rather than before the probe leaves the table at most half full on
-        // entry, so the loop above always meets an empty slot and always terminates.
+        // entry, so the probe loop always meets an empty slot and always terminates.
         if self.used * MAX_LOAD_DEN > self.entries.len() * MAX_LOAD_NUM {
             self.grow();
         }
@@ -202,6 +363,16 @@ impl InlineTable {
     pub fn is_empty(&self) -> bool {
         self.used == 0
     }
+}
+
+/// Extends an entry's range. Out of line so the common row pays no store; see [`upsert`].
+///
+/// [`upsert`]: InlineTable::upsert
+#[cold]
+#[inline(never)]
+fn widen(e: &mut Entry, value: i16) {
+    e.min = e.min.min(value);
+    e.max = e.max.max(value);
 }
 
 /// Compares the part of a name that does not fit inline: the stored copy in `keys` against
@@ -287,6 +458,20 @@ mod tests {
         assert_eq!(t.len(), 5);
         assert_eq!(got["a"], (1, 10, 11, 2));
         assert_eq!(got["c"], (3, 30, 33, 2));
+    }
+
+    /// The probe no longer compares lengths — it relies on a name being recoverable from its
+    /// zero-padded key. That holds only while names contain no NUL, and the case it protects is
+    /// a name that is a strict prefix of another. Check a whole prefix chain, including the one
+    /// that runs across the 32-byte seam where the inline key stops covering the name.
+    #[test]
+    fn a_name_is_never_confused_with_its_own_prefixes() {
+        let base = "Sankt_Peterburg_Oblast_Station_Nord";
+        let names: Vec<String> = (1..=base.len()).map(|n| base[..n].to_string()).collect();
+        let refs: Vec<(&str, i16)> = names.iter().map(|n| (n.as_str(), 1i16)).collect();
+        let t = run(&refs, 8);
+        assert_eq!(t.len(), names.len(), "prefixes merged into one entry");
+        assert!(collect(&t).values().all(|&s| s == (1, 1, 1, 1)));
     }
 
     /// Exercises the `len > INLINE_KEY` fallback, including names that are identical for

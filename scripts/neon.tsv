@@ -1,0 +1,12 @@
+touch t18	OBRC_THREADS=18 ./target/release/hot_floor touch measurements.txt
+raw3 t18	OBRC_THREADS=18 ./target/release/hot_floor raw3 measurements.txt
+keyed3 t18	OBRC_THREADS=18 ./target/release/hot_floor keyed3 measurements.txt
+mask t18	OBRC_THREADS=18 ./target/release/hot_floor mask measurements.txt
+mask_semi t18	OBRC_THREADS=18 ./target/release/hot_floor mask_semi measurements.txt
+dlrows t18	OBRC_THREADS=18 ./target/release/hot_floor dlrows measurements.txt
+dltable t18	OBRC_THREADS=18 ./target/release/hot_floor dltable measurements.txt
+nltable t18	OBRC_THREADS=18 ./target/release/hot_floor nltable measurements.txt
+touch t6	OBRC_THREADS=6 ./target/release/hot_floor touch measurements.txt
+keyed3 t6	OBRC_THREADS=6 ./target/release/hot_floor keyed3 measurements.txt
+mask t6	OBRC_THREADS=6 ./target/release/hot_floor mask measurements.txt
+dltable t6	OBRC_THREADS=6 ./target/release/hot_floor dltable measurements.txt

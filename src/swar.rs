@@ -85,8 +85,8 @@ fn scan_loop_long(data: &[u8], pos: usize) -> (usize, u64) {
 /// each. Reading both words unconditionally and selecting between them is strictly more
 /// work in instructions and strictly less in cycles.
 ///
-/// 97.1% of the list fits the window; the rest take a [`cold`](find_semi_and_hash_long)
-/// re-scan, and *that* branch is biased ~33:1, so it predicts.
+/// 97.1% of the list fits the window; the rest take a `#[cold]` re-scan through the loop, and
+/// *that* branch is biased ~33:1, so it predicts.
 ///
 /// The hash is bit-identical to [`find_semi_and_hash`] for every name this path handles,
 /// which is what lets both share `find_semi_and_hash_scalar` as their reference.
@@ -110,15 +110,51 @@ pub fn find_semi_and_hash_flat_raw(data: &[u8], pos: usize) -> (usize, u64) {
     scan_flat(data, pos)
 }
 
+/// [`find_semi_and_hash_flat_raw`] for a caller that already knows where the name ends.
+///
+/// A delimiter bitmap yields the `;` for free, which kills the two SWAR masks, the
+/// `trailing_zeros` and the branch that picks between the two words' results — everything but
+/// the loads and the mix chain. The remaining select is on `len`, which the caller has in a
+/// register well before the bytes arrive, so it no longer sits behind the load.
+///
+/// Bit-identical to [`find_semi_and_hash_flat_raw`] at every length, including the handoff at
+/// 16 where both give up and re-scan.
 #[inline(always)]
-fn scan_flat(data: &[u8], pos: usize) -> (usize, u64) {
+pub fn hash_len_raw(data: &[u8], pos: usize, len: usize) -> u64 {
+    if len >= 16 {
+        return scan_loop_long(data, pos).1;
+    }
+    let w0 = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+
+    let keep = (1u64 << (8 * (len & 7))) - 1;
+    let short = len < 8;
+    let prev = if short { 0 } else { mix(0, w0) };
+    let last = if short { w0 } else { w1 } & keep;
+    mix(prev, last)
+}
+
+/// [`find_semi_and_hash_flat_raw`], also handing back the name's 16-byte window already
+/// zero-padded — the two little-endian words of
+/// [`probe_key`](crate::inline_table::probe_key)'s low half.
+///
+/// The scan loads those bytes anyway, and it already masks the word the `;` falls in, to keep
+/// the trailing garbage out of the hash. That masked window *is* the probe key for any name
+/// short enough to fit here, with the high half zero, so returning it costs one select and
+/// saves the table four loads, two mask-table lookups and four `and`s — and saves the
+/// register allocator having to keep a 32-byte key alive across the hash, which it was
+/// spilling to the stack.
+///
+/// `None` when the window holds no `;`: the length is not known here, so neither is the key.
+#[inline(always)]
+pub fn scan_flat_keyed(data: &[u8], pos: usize) -> Option<(usize, u64, u64, u64)> {
     let w0 = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
     let w1 = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
     let m0 = semi_mask(w0);
     let m1 = semi_mask(w1);
 
     if m0 | m1 == 0 {
-        return scan_loop_long(data, pos);
+        return None;
     }
 
     // `trailing_zeros` is 64 on a zero mask, so this is 8 exactly when word 0 holds no `;`.
@@ -136,8 +172,19 @@ fn scan_flat(data: &[u8], pos: usize) -> (usize, u64) {
     let short = len < 8;
     let prev = if short { 0 } else { mix(0, w0) };
     let last = if short { w0 } else { w1 } & keep;
+    // The same two words the hash consumed, in name order: a short name's masked word is the
+    // whole key, a longer one's is the second half.
+    let (klo, khi) = if short { (last, 0) } else { (w0, last) };
 
-    (pos + len, mix(prev, last))
+    Some((pos + len, mix(prev, last), klo, khi))
+}
+
+#[inline(always)]
+fn scan_flat(data: &[u8], pos: usize) -> (usize, u64) {
+    match scan_flat_keyed(data, pos) {
+        Some((semi, h, _, _)) => (semi, h),
+        None => scan_loop_long(data, pos),
+    }
 }
 
 /// Byte-at-a-time equivalent, for the end of the file where the wide load would run off
@@ -209,6 +256,55 @@ mod tests {
         for (name, _) in STATIONS {
             let d = line(name);
             assert_eq!(find_semi_and_hash_flat(&d, 0), find_semi_and_hash_scalar(&d, 0), "{name}");
+        }
+    }
+
+    /// The length-driven hash drops the scan on the claim that it only ever used it to derive
+    /// the length. Check that against the scan it replaces at every length, including 16 where
+    /// both fall back, and on every real name.
+    #[test]
+    fn length_driven_hash_agrees_with_the_flat_scan() {
+        for len in 0..=100usize {
+            let name: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            let d = line(&name);
+            let (semi, want) = find_semi_and_hash_flat_raw(&d, 0);
+            assert_eq!(semi, len);
+            assert_eq!(hash_len_raw(&d, 0, len), want, "length {len}");
+        }
+        for (name, _) in STATIONS {
+            let d = line(name);
+            let want = find_semi_and_hash_flat_raw(&d, 0).1;
+            assert_eq!(hash_len_raw(&d, 0, name.len()), want, "{name}");
+        }
+    }
+
+    /// v11 stops building the probe key from memory and takes the scan's masked words
+    /// instead. That is only sound if the two agree bit for bit, so check them against each
+    /// other at every length the window covers — 0 and 8 included, where the mask is empty —
+    /// and on every real name. Also require the scan to decline exactly when the key would be
+    /// wrong, at 16 and above, since past there the high half is no longer zero.
+    #[test]
+    fn the_scans_key_matches_the_one_built_from_memory() {
+        use crate::inline_table::{key_from_words, probe_key};
+
+        let check = |name: &str| {
+            let d = line(name);
+            match scan_flat_keyed(&d, 0) {
+                Some((semi, _, klo, khi)) => {
+                    assert_eq!(semi, name.len(), "{name:?}");
+                    assert!(name.len() < 16, "{name:?} should have declined");
+                    assert_eq!(key_from_words(klo, khi), probe_key(&d, 0, semi), "{name:?}");
+                }
+                None => assert!(name.len() >= 16, "{name:?} declined but fits the window"),
+            }
+        };
+
+        for len in 0..=100usize {
+            let name: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            check(&name);
+        }
+        for (name, _) in STATIONS {
+            check(name);
         }
     }
 

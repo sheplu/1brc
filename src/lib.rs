@@ -4,6 +4,7 @@
 //! must produce byte-identical output. `v1_naive` is the correctness oracle and shares no
 //! arithmetic with the others.
 
+pub mod block;
 pub mod chunk;
 pub mod hash;
 pub mod inline_table;

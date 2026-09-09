@@ -31,11 +31,13 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use obrc::block::{block_delims, block_newlines, block_semis, BLOCK};
 use obrc::chunk::{chunk_bounds, local_bounds, num_chunks, split_streams, CHUNK_SIZE};
 use obrc::inline_table::{InlineTable, KEY_SLACK};
-use obrc::parse::parse_temp_branchless;
+use obrc::parse::{parse_temp_branchless, parse_temp_len};
 use obrc::swar::{
-    find_semi_and_hash, find_semi_and_hash_flat, find_semi_and_hash_flat_raw, FLAT_SLACK,
+    find_semi_and_hash, find_semi_and_hash_flat, find_semi_and_hash_flat_raw, hash_len_raw,
+    scan_flat_keyed, FLAT_SLACK,
 };
 use obrc::sys::{set_thread_qos_user_interactive, Mapping};
 use obrc::table::Table;
@@ -54,6 +56,7 @@ const OVERLAP: usize = MAX_LINE_LEN;
 /// parser loads 8 bytes, and the inline probe reads 32 from the name start.
 const TAIL_GUARD: usize = MAX_LINE_LEN + FLAT_SLACK;
 const _: () = assert!(TAIL_GUARD >= KEY_SLACK);
+const _: () = assert!(TAIL_GUARD >= BLOCK);
 
 const SEMI: u64 = 0x3B3B_3B3B_3B3B_3B3B;
 const LOW: u64 = 0x0101_0101_0101_0101;
@@ -88,6 +91,23 @@ fn fhash_only(data: &[u8], pos: usize) -> (u64, usize) {
     let (semi, h) = find_semi_and_hash_flat(data, pos);
     let (v, next) = parse_temp_branchless(data, semi + 1);
     (h ^ v as u64, next)
+}
+
+/// Loop scan + hash + parse, no table.
+#[inline(always)]
+fn hash_only(data: &[u8], pos: usize) -> (u64, usize) {
+    let (semi, h) = find_semi_and_hash(data, pos);
+    let (v, next) = parse_temp_branchless(data, semi + 1);
+    (h ^ v as u64, next)
+}
+
+/// [`full`] with the key comparison removed, to price it.
+#[inline(always)]
+fn nocmp(data: &[u8], table: &mut Table, pos: usize) -> (u64, usize) {
+    let (semi, h) = find_semi_and_hash(data, pos);
+    let (v, next) = parse_temp_branchless(data, semi + 1);
+    table.upsert_no_key_compare(data, pos, semi - pos, h, v);
+    (h, next)
 }
 
 /// Scan + hash + parse + upsert into the offset-keyed table.
@@ -128,7 +148,130 @@ fn full_raw(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
     (h, next)
 }
 
-/// As `streamed`, but each stream upserts into its own table, so no two streams ever write
+/// [`full_raw`] with the probe key taken from the scan rather than rebuilt from memory, and the
+/// probe collapsed to the key's low half: v11's row. Names of 16 bytes and over fall out of the
+/// scan's window, so they take `full_raw` itself, out of line. Same hash as `raw`, so the sink
+/// must match it exactly.
+#[inline(always)]
+fn full_keyed(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
+    let Some((semi, h, klo, khi)) = scan_flat_keyed(data, pos) else {
+        return full_keyed_long(data, table, pos);
+    };
+    let (v, next) = parse_temp_branchless(data, semi + 1);
+    table.upsert_words(data, pos, semi - pos, h, v, klo, khi);
+    (h, next)
+}
+
+#[cold]
+#[inline(never)]
+fn full_keyed_long(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
+    full_raw(data, table, pos)
+}
+
+/// One row's work, as a trait rather than a closure or a fn item.
+///
+/// Both of those reach the driver through a compiler-generated `Fn::call` shim, and nothing can
+/// mark that shim `#[inline(always)]`. LLVM then inlines it on cost — and the cost includes the
+/// always-inline body it wraps, so the shim lands over threshold for exactly the modes that do
+/// the most work, which are the ones the harness exists to measure. `raw2` shipped a call per
+/// row while `raw3` did not. A trait method is a direct call to a function written here, so the
+/// attribute goes where it is needed and the outcome stops depending on a threshold.
+trait Step {
+    /// Returns the value to fold into the sink and the start of the next row.
+    fn step(&mut self, data: &[u8], pos: usize) -> (u64, usize);
+}
+
+/// [`Step`] for a driver that already knows where the row ends.
+trait Row {
+    fn row(&mut self, data: &[u8], pos: usize, nl: usize) -> u64;
+}
+
+/// [`Row`] for a driver that also knows where the `;` is.
+trait Pair {
+    fn pair(&mut self, data: &[u8], pos: usize, semi: usize, nl: usize) -> u64;
+}
+
+macro_rules! step {
+    ($name:ident, $body:expr) => {
+        struct $name;
+        impl Step for $name {
+            #[inline(always)]
+            fn step(&mut self, data: &[u8], pos: usize) -> (u64, usize) {
+                $body(data, pos)
+            }
+        }
+    };
+    ($name:ident, $ctx:ty, $body:expr) => {
+        struct $name<'a>(&'a mut $ctx);
+        impl Step for $name<'_> {
+            #[inline(always)]
+            fn step(&mut self, data: &[u8], pos: usize) -> (u64, usize) {
+                $body(data, &mut *self.0, pos)
+            }
+        }
+    };
+}
+
+step!(ParseOnly, parse_only);
+step!(HashOnly, hash_only);
+step!(FhashOnly, fhash_only);
+step!(Full, Table, full);
+step!(Nocmp, Table, nocmp);
+step!(FullInline, InlineTable, full_inline);
+step!(FullFlat, InlineTable, full_flat);
+step!(FullRaw, InlineTable, full_raw);
+step!(FullKeyed, InlineTable, full_keyed);
+
+struct RowFlat;
+impl Row for RowFlat {
+    #[inline(always)]
+    fn row(&mut self, data: &[u8], pos: usize, nl: usize) -> u64 {
+        row_flat(data, pos, nl)
+    }
+}
+
+struct RowLen;
+impl Row for RowLen {
+    #[inline(always)]
+    fn row(&mut self, data: &[u8], pos: usize, nl: usize) -> u64 {
+        row_len(data, pos, nl)
+    }
+}
+
+struct RowTable<'a>(&'a mut InlineTable);
+impl Row for RowTable<'_> {
+    #[inline(always)]
+    fn row(&mut self, data: &[u8], pos: usize, nl: usize) -> u64 {
+        row_table(data, self.0, pos, nl)
+    }
+}
+
+/// Wraps one mode's whole loop in a function of its own.
+///
+/// `run_chunk` dispatches forty modes, and inlined into it the drivers were competing for a
+/// single budget that LLVM spent in source order: early modes ended up with an out-of-line
+/// `bl` to `InlineTable::upsert`, later ones had it inlined. A mode was therefore faster or
+/// slower partly by where it sat in the `match` — exactly the artefact this harness exists to
+/// rule out. Being generic over `f`, this gets one instantiation per call site, so every mode
+/// starts with a full budget; the extra call costs one branch per 2 MiB chunk.
+///
+/// The drivers themselves stay `#[inline(always)]`, because the row body has to fuse *into*
+/// the loop. Marking the drivers `#[inline(never)]` instead looks equivalent and is not: the
+/// row body then fails to inline into the driver and the call lands back on every row.
+///
+/// The row bodies reach the drivers as [`Step`]/[`Row`]/[`Pair`] impls rather than closures,
+/// for the same reason. A closure passed as `impl Fn` is one opaque callee that LLVM may or
+/// may not inline depending on remaining budget; a zero-sized struct with an
+/// `#[inline(always)]` trait method is not optional.
+#[inline(never)]
+fn once<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+// The drivers below keep their accumulators in locals for the same reason: passed as `&mut`
+// across a call the compiler cannot see through, both were reloaded and stored back per row.
+
+/// As [`streamed`], but each stream upserts into its own table, so no two streams ever write
 /// the same address. Tests whether the shared table's load/store ordering is what stops the
 /// streams from overlapping.
 #[inline(always)]
@@ -140,6 +283,7 @@ fn streamed_split<const N: usize>(
     n: &mut u64,
     tables: &mut [Table],
 ) {
+    let (mut a, mut rows) = (*acc, *n);
     let mut s = split_streams::<N>(data, start, end);
     loop {
         let mut all = true;
@@ -151,19 +295,235 @@ fn streamed_split<const N: usize>(
         }
         for k in 0..N {
             let (h, next) = full(data, &mut tables[k], s[k].0);
-            *acc ^= h;
+            a ^= h;
             s[k].0 = next;
         }
-        *n += N as u64;
+        rows += N as u64;
     }
     for k in 0..N {
         while s[k].0 < s[k].1 {
             let (h, next) = full(data, &mut tables[k], s[k].0);
-            *acc ^= h;
+            a ^= h;
             s[k].0 = next;
-            *n += 1;
+            rows += 1;
         }
     }
+    (*acc, *n) = (a, rows);
+}
+
+/// Row loop driven by the newline bitmap instead of by the previous row's parse.
+///
+/// Every version so far learns where row `i+1` begins only after row `i`'s temperature has
+/// been parsed. [`split_streams`] hides that by interleaving three chains; this removes it.
+/// One `block_newlines` call yields every row boundary in 64 bytes up front, so the rows in a
+/// block are independent by construction and the out-of-order window can overlap them.
+///
+/// Blocks are aligned down from `start` and the bits below it masked off, so the mask always
+/// covers whole 64-byte lines of the input. The final block is truncated at `end`, whose
+/// newline the next chunk must not see twice. A file with no trailing newline leaves a row
+/// with no bit at all, which the tail check after the loop picks up.
+#[inline(always)]
+fn drain_newlines(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    acc: &mut u64,
+    n: &mut u64,
+    mut r: impl Row,
+) {
+    let (mut a, mut rows) = (*acc, *n);
+    let mut base = start & !(BLOCK - 1);
+    let mut pos = start;
+    // Newlines before `start` closed rows the previous chunk owns.
+    let mut keep = !0u64 << (start - base);
+
+    while base < end {
+        let mut m = unsafe { block_newlines(data.as_ptr().add(base)) } & keep;
+        keep = !0;
+        if base + BLOCK > end {
+            // 1 ..= 63 here, so the shift is in range.
+            m &= (1u64 << (end - base)) - 1;
+        }
+        while m != 0 {
+            let nl = base + m.trailing_zeros() as usize;
+            m &= m - 1;
+            a ^= r.row(data, pos, nl);
+            pos = nl + 1;
+            rows += 1;
+        }
+        base += BLOCK;
+    }
+
+    // Only fires on a final chunk whose file has no trailing newline.
+    if pos < end {
+        a ^= r.row(data, pos, end);
+        rows += 1;
+    }
+    (*acc, *n) = (a, rows);
+}
+
+/// Scan + hash + parse for a row whose end is already known. The parser still finds the line
+/// end itself, so the assert is a free cross-check that the mask agrees with it.
+#[inline(always)]
+fn row_flat(data: &[u8], pos: usize, nl: usize) -> u64 {
+    let (semi, h) = find_semi_and_hash_flat_raw(data, pos);
+    let (v, next) = parse_temp_branchless(data, semi + 1);
+    debug_assert_eq!(next, nl + 1, "bitmap and parser disagree on where the row ends");
+    h ^ v as u64
+}
+
+/// [`row_flat`] with the parser's dot search replaced by the length the mask already gave us.
+#[inline(always)]
+fn row_len(data: &[u8], pos: usize, nl: usize) -> u64 {
+    let (semi, h) = find_semi_and_hash_flat_raw(data, pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    h ^ v as u64
+}
+
+/// [`row_len`] plus the inline-key upsert — v10's engine with the bitmap driving the rows.
+#[inline(always)]
+fn row_table(data: &[u8], table: &mut InlineTable, pos: usize, nl: usize) -> u64 {
+    let (semi, h) = find_semi_and_hash_flat_raw(data, pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    table.upsert(data, pos, semi - pos, h, v);
+    h
+}
+
+/// Both delimiters come from the bitmap, so nothing scans the row: the hash is driven by the
+/// name length and the temperature by the value length.
+#[inline(always)]
+fn pair_rows(data: &[u8], pos: usize, semi: usize, nl: usize) -> u64 {
+    let h = hash_len_raw(data, pos, semi - pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    h ^ v as u64
+}
+
+/// [`pair_rows`] plus the inline-key upsert.
+#[inline(always)]
+fn pair_table(data: &[u8], table: &mut InlineTable, pos: usize, semi: usize, nl: usize) -> u64 {
+    let h = hash_len_raw(data, pos, semi - pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    table.upsert(data, pos, semi - pos, h, v);
+    h
+}
+
+/// [`pair_table`] with the key dropped, to price it.
+#[inline(always)]
+fn pair_nokey(data: &[u8], table: &mut InlineTable, pos: usize, semi: usize, nl: usize) -> u64 {
+    let h = hash_len_raw(data, pos, semi - pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    table.upsert_no_key(data, pos, semi - pos, h, v);
+    h
+}
+
+/// [`pair_table`] with the accumulate dropped, to price it.
+#[inline(always)]
+fn pair_nostats(data: &[u8], table: &mut InlineTable, pos: usize, semi: usize, nl: usize) -> u64 {
+    let h = hash_len_raw(data, pos, semi - pos);
+    let v = parse_temp_len(data, semi + 1, nl - semi - 1);
+    table.upsert_no_stats(data, pos, semi - pos, h, v);
+    h
+}
+
+struct PairRows;
+impl Pair for PairRows {
+    #[inline(always)]
+    fn pair(&mut self, data: &[u8], pos: usize, semi: usize, nl: usize) -> u64 {
+        pair_rows(data, pos, semi, nl)
+    }
+}
+
+struct PairTable<'a>(&'a mut InlineTable);
+impl Pair for PairTable<'_> {
+    #[inline(always)]
+    fn pair(&mut self, data: &[u8], pos: usize, semi: usize, nl: usize) -> u64 {
+        pair_table(data, self.0, pos, semi, nl)
+    }
+}
+
+struct PairNokey<'a>(&'a mut InlineTable);
+impl Pair for PairNokey<'_> {
+    #[inline(always)]
+    fn pair(&mut self, data: &[u8], pos: usize, semi: usize, nl: usize) -> u64 {
+        pair_nokey(data, self.0, pos, semi, nl)
+    }
+}
+
+struct PairNostats<'a>(&'a mut InlineTable);
+impl Pair for PairNostats<'_> {
+    #[inline(always)]
+    fn pair(&mut self, data: &[u8], pos: usize, semi: usize, nl: usize) -> u64 {
+        pair_nostats(data, self.0, pos, semi, nl)
+    }
+}
+
+/// [`drain_newlines`] driven by both bitmaps, so no row is scanned at all.
+///
+/// Names hold no `;` and temperatures hold no `\n`, so the two delimiters strictly alternate
+/// and the k-th `;` in a chunk belongs to the k-th `\n`. Pairing is therefore just popping one
+/// bit from each mask, with one exception: a row's `;` can land in one block and its `\n` in
+/// the next, which leaves a `;` bit with no partner. At most one can ever be outstanding —
+/// the `\n` follows its `;` within six bytes, and the next `;` follows that `\n` — so a single
+/// carried position covers it.
+#[inline(always)]
+fn drain_delims(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    acc: &mut u64,
+    n: &mut u64,
+    mut r: impl Pair,
+) {
+    let (mut a, mut rows) = (*acc, *n);
+    let mut base = start & !(BLOCK - 1);
+    let mut pos = start;
+    let mut keep = !0u64 << (start - base);
+    // One past the carried `;`, or 0 for none. Offsetting by one keeps position 0 — a chunk
+    // starting on an empty name — from reading as "nothing carried".
+    let mut carry = 0usize;
+
+    while base < end {
+        let (mut sm, mut nm) = unsafe { block_delims(data.as_ptr().add(base)) };
+        sm &= keep;
+        nm &= keep;
+        keep = !0;
+        if base + BLOCK > end {
+            let last = (1u64 << (end - base)) - 1;
+            sm &= last;
+            nm &= last;
+        }
+
+        while nm != 0 {
+            let nl = base + nm.trailing_zeros() as usize;
+            nm &= nm - 1;
+
+            // Selected without branching: the carry fires on about one row in six, often
+            // enough to cost mispredictions and too rarely for any history to predict.
+            let low = sm & sm.wrapping_neg();
+            let taken = 0u64.wrapping_sub((carry == 0) as u64);
+            let semi = if carry != 0 { carry - 1 } else { base + low.trailing_zeros() as usize };
+            sm ^= low & taken;
+            carry = 0;
+
+            a ^= r.pair(data, pos, semi, nl);
+            pos = nl + 1;
+            rows += 1;
+        }
+
+        debug_assert!(sm.count_ones() <= 1, "two unpaired `;` at a block boundary");
+        if sm != 0 {
+            carry = base + sm.trailing_zeros() as usize + 1;
+        }
+        base += BLOCK;
+    }
+
+    // Only fires on a final chunk whose file has no trailing newline.
+    if pos < end {
+        let semi = if carry != 0 { carry - 1 } else { find_semi(data, pos) };
+        a ^= r.pair(data, pos, semi, end);
+        rows += 1;
+    }
+    (*acc, *n) = (a, rows);
 }
 
 /// Runs `step` over `N` independent line streams covering `[start, end)`.
@@ -174,8 +534,9 @@ fn streamed<const N: usize>(
     end: usize,
     acc: &mut u64,
     n: &mut u64,
-    mut step: impl FnMut(&[u8], usize) -> (u64, usize),
+    mut step: impl Step,
 ) {
+    let (mut a, mut rows) = (*acc, *n);
     let mut s = split_streams::<N>(data, start, end);
     loop {
         let mut all = true;
@@ -186,20 +547,35 @@ fn streamed<const N: usize>(
             break;
         }
         for k in 0..N {
-            let (v, next) = step(data, s[k].0);
-            *acc ^= v;
+            let (v, next) = step.step(data, s[k].0);
+            a ^= v;
             s[k].0 = next;
         }
-        *n += N as u64;
+        rows += N as u64;
     }
     for k in 0..N {
         while s[k].0 < s[k].1 {
-            let (v, next) = step(data, s[k].0);
-            *acc ^= v;
+            let (v, next) = step.step(data, s[k].0);
+            a ^= v;
             s[k].0 = next;
-            *n += 1;
+            rows += 1;
         }
     }
+    (*acc, *n) = (a, rows);
+}
+
+/// [`streamed`] with one stream — the serial dependency chain every version up to v10 walks.
+#[inline(always)]
+fn serial(data: &[u8], start: usize, end: usize, acc: &mut u64, n: &mut u64, mut step: impl Step) {
+    let (mut a, mut rows) = (*acc, *n);
+    let mut pos = start;
+    while pos < end {
+        let (v, next) = step.step(data, pos);
+        a ^= v;
+        pos = next;
+        rows += 1;
+    }
+    (*acc, *n) = (a, rows);
 }
 
 /// Per-thread scratch. Only the table the mode actually uses is allocated at full size;
@@ -220,7 +596,14 @@ impl State {
             _ => 0,
         };
         let inline_bits =
-            if ["itable", "flat", "raw"].iter().any(|p| mode.starts_with(p)) { bits } else { 0 };
+            if ["itable", "flat", "raw", "keyed", "nltable", "dltable", "dlnokey", "dlnostats"]
+                .iter()
+                .any(|p| mode.starts_with(p))
+            {
+                bits
+            } else {
+                0
+            };
         let split_n = match mode {
             "split2" => 2,
             "split4" => 4,
@@ -248,104 +631,88 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
                 *acc ^= u64::from_le_bytes(c.try_into().unwrap());
             }
         }
-        "parse" => {
+        "parse" => once(|| serial(data, pos, end, acc, n, ParseOnly)),
+        "hash" => once(|| serial(data, pos, end, acc, n, HashOnly)),
+        "table" => once(|| serial(data, pos, end, acc, n, Full(table))),
+        "itable" => once(|| serial(data, pos, end, acc, n, FullInline(itable))),
+        "fhash" => once(|| serial(data, pos, end, acc, n, FhashOnly)),
+        "flat" => once(|| serial(data, pos, end, acc, n, FullFlat(itable))),
+        "raw" => once(|| serial(data, pos, end, acc, n, FullRaw(itable))),
+        "keyed" => once(|| serial(data, pos, end, acc, n, FullKeyed(itable))),
+        "nocmp" => once(|| serial(data, pos, end, acc, n, Nocmp(table))),
+        // Delimiter bitmaps only, no rows drained. Everything a block-at-a-time design would
+        // do is additive on top of this, so if `mask` alone is not far below `flat3` the
+        // approach is dead before any of it is written.
+        "mask" => {
             while pos < end {
-                let (v, next) = parse_only(data, pos);
-                *acc ^= v;
-                pos = next;
-                *n += 1;
+                let (s, nl) = unsafe { block_delims(data.as_ptr().add(pos)) };
+                *acc ^= s ^ nl.rotate_left(1);
+                pos += BLOCK;
             }
         }
-        "hash" => {
+        "mask_semi" => {
             while pos < end {
-                let (semi, h) = find_semi_and_hash(data, pos);
-                let (v, next) = parse_temp_branchless(data, semi + 1);
-                *acc ^= h ^ v as u64;
-                pos = next;
-                *n += 1;
+                *acc ^= unsafe { block_semis(data.as_ptr().add(pos)) };
+                pos += BLOCK;
             }
         }
-        "table" => {
+        "mask_nl" => {
             while pos < end {
-                let (h, next) = full(data, table, pos);
-                *acc ^= h;
-                pos = next;
-                *n += 1;
+                *acc ^= unsafe { block_newlines(data.as_ptr().add(pos)) };
+                pos += BLOCK;
             }
         }
-        "itable" => {
-            while pos < end {
-                let (h, next) = full_inline(data, itable, pos);
-                *acc ^= h;
-                pos = next;
-                *n += 1;
-            }
-        }
-        "fhash" => {
-            while pos < end {
-                let (semi, h) = find_semi_and_hash_flat(data, pos);
-                let (v, next) = parse_temp_branchless(data, semi + 1);
-                *acc ^= h ^ v as u64;
-                pos = next;
-                *n += 1;
-            }
-        }
-        "flat" => {
-            while pos < end {
-                let (h, next) = full_flat(data, itable, pos);
-                *acc ^= h;
-                pos = next;
-                *n += 1;
-            }
-        }
-        "raw" => {
-            while pos < end {
-                let (h, next) = full_raw(data, itable, pos);
-                *acc ^= h;
-                pos = next;
-                *n += 1;
-            }
-        }
-        "parse2" => streamed::<2>(data, pos, end, acc, n, parse_only),
-        "parse3" => streamed::<3>(data, pos, end, acc, n, parse_only),
-        "parse4" => streamed::<4>(data, pos, end, acc, n, parse_only),
-        "parse8" => streamed::<8>(data, pos, end, acc, n, parse_only),
-        "table2" => streamed::<2>(data, pos, end, acc, n, |d, p| full(d, table, p)),
-        "table3" => streamed::<3>(data, pos, end, acc, n, |d, p| full(d, table, p)),
-        "table4" => streamed::<4>(data, pos, end, acc, n, |d, p| full(d, table, p)),
-        "table8" => streamed::<8>(data, pos, end, acc, n, |d, p| full(d, table, p)),
-        "itable2" => streamed::<2>(data, pos, end, acc, n, |d, p| full_inline(d, itable, p)),
-        "itable3" => streamed::<3>(data, pos, end, acc, n, |d, p| full_inline(d, itable, p)),
-        "itable4" => streamed::<4>(data, pos, end, acc, n, |d, p| full_inline(d, itable, p)),
-        "itable8" => streamed::<8>(data, pos, end, acc, n, |d, p| full_inline(d, itable, p)),
-        "fhash2" => streamed::<2>(data, pos, end, acc, n, fhash_only),
-        "fhash4" => streamed::<4>(data, pos, end, acc, n, fhash_only),
-        "flat2" => streamed::<2>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
-        "flat3" => streamed::<3>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
-        "flat4" => streamed::<4>(data, pos, end, acc, n, |d, p| full_flat(d, itable, p)),
-        "raw2" => streamed::<2>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
-        "raw3" => streamed::<3>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
-        "raw4" => streamed::<4>(data, pos, end, acc, n, |d, p| full_raw(d, itable, p)),
-        "nocmp" => {
-            while pos < end {
-                let (semi, h) = find_semi_and_hash(data, pos);
-                let (v, next) = parse_temp_branchless(data, semi + 1);
-                table.upsert_no_key_compare(data, pos, semi - pos, h, v);
-                *acc ^= h;
-                pos = next;
-                *n += 1;
-            }
-        }
-        "split2" => streamed_split::<2>(data, pos, end, acc, n, split),
-        "split4" => streamed_split::<4>(data, pos, end, acc, n, split),
-        "split8" => streamed_split::<8>(data, pos, end, acc, n, split),
+        // Rows driven by the newline bitmap. `nlrows` keeps v10's per-row work exactly, so
+        // against `raw` it prices the loop shape alone; `nlparse` then spends the newline the
+        // mask already produced, and `nltable` adds the upsert back to make it v10's engine.
+        "nlrows" => once(|| drain_newlines(data, pos, end, acc, n, RowFlat)),
+        "nlparse" => once(|| drain_newlines(data, pos, end, acc, n, RowLen)),
+        "nltable" => once(|| drain_newlines(data, pos, end, acc, n, RowTable(itable))),
+        // Both delimiters from the bitmap: `dlrows` drops the flat scan that `nlrows` still
+        // runs, and `dltable` is the whole of v10's per-row work with no scanning left in it.
+        "dlrows" => once(|| drain_delims(data, pos, end, acc, n, PairRows)),
+        "dltable" => once(|| drain_delims(data, pos, end, acc, n, PairTable(itable))),
+        // The upsert's two halves, priced against `dltable` on the same driver.
+        "dlnokey" => once(|| drain_delims(data, pos, end, acc, n, PairNokey(itable))),
+        "dlnostats" => once(|| drain_delims(data, pos, end, acc, n, PairNostats(itable))),
+        "parse2" => once(|| streamed::<2>(data, pos, end, acc, n, ParseOnly)),
+        "parse3" => once(|| streamed::<3>(data, pos, end, acc, n, ParseOnly)),
+        "parse4" => once(|| streamed::<4>(data, pos, end, acc, n, ParseOnly)),
+        "parse8" => once(|| streamed::<8>(data, pos, end, acc, n, ParseOnly)),
+        "table2" => once(|| streamed::<2>(data, pos, end, acc, n, Full(table))),
+        "table3" => once(|| streamed::<3>(data, pos, end, acc, n, Full(table))),
+        "table4" => once(|| streamed::<4>(data, pos, end, acc, n, Full(table))),
+        "table8" => once(|| streamed::<8>(data, pos, end, acc, n, Full(table))),
+        "itable2" => once(|| streamed::<2>(data, pos, end, acc, n, FullInline(itable))),
+        "itable3" => once(|| streamed::<3>(data, pos, end, acc, n, FullInline(itable))),
+        "itable4" => once(|| streamed::<4>(data, pos, end, acc, n, FullInline(itable))),
+        "itable8" => once(|| streamed::<8>(data, pos, end, acc, n, FullInline(itable))),
+        "fhash2" => once(|| streamed::<2>(data, pos, end, acc, n, FhashOnly)),
+        "fhash4" => once(|| streamed::<4>(data, pos, end, acc, n, FhashOnly)),
+        "flat2" => once(|| streamed::<2>(data, pos, end, acc, n, FullFlat(itable))),
+        "flat3" => once(|| streamed::<3>(data, pos, end, acc, n, FullFlat(itable))),
+        "flat4" => once(|| streamed::<4>(data, pos, end, acc, n, FullFlat(itable))),
+        "raw2" => once(|| streamed::<2>(data, pos, end, acc, n, FullRaw(itable))),
+        "raw3" => once(|| streamed::<3>(data, pos, end, acc, n, FullRaw(itable))),
+        "raw4" => once(|| streamed::<4>(data, pos, end, acc, n, FullRaw(itable))),
+        "keyed3" => once(|| streamed::<3>(data, pos, end, acc, n, FullKeyed(itable))),
+        "split2" => once(|| streamed_split::<2>(data, pos, end, acc, n, split)),
+        "split4" => once(|| streamed_split::<4>(data, pos, end, acc, n, split)),
+        "split8" => once(|| streamed_split::<8>(data, pos, end, acc, n, split)),
         other => panic!("unknown mode {other:?}"),
     }
 }
 
 /// Walks the mapping directly. The last [`TAIL_GUARD`] bytes are skipped, because the wide
 /// paths would read off the end of it.
-fn worker_mmap(mode: &str, bits: u32, data: &[u8], total: usize, cursor: &AtomicUsize) -> State {
+fn worker_mmap(
+    mode: &str,
+    bits: u32,
+    data: &[u8],
+    chunk: usize,
+    total: usize,
+    cursor: &AtomicUsize,
+) -> State {
     set_thread_qos_user_interactive();
     let mut st = State::new(mode, bits);
     let wide_limit = data.len().saturating_sub(TAIL_GUARD);
@@ -355,7 +722,7 @@ fn worker_mmap(mode: &str, bits: u32, data: &[u8], total: usize, cursor: &Atomic
         if i >= total {
             break;
         }
-        let Some((start, chunk_end)) = chunk_bounds(data, i, CHUNK_SIZE) else {
+        let Some((start, chunk_end)) = chunk_bounds(data, i, chunk) else {
             continue;
         };
         let end = chunk_end.min(wide_limit).max(start);
@@ -371,26 +738,27 @@ fn worker_pread(
     bits: u32,
     file: &File,
     len: usize,
+    chunk: usize,
     total: usize,
     cursor: &AtomicUsize,
 ) -> State {
     set_thread_qos_user_interactive();
     let mut st = State::new(mode, bits);
-    let mut buf = vec![0u8; CHUNK_SIZE + OVERLAP + TAIL_GUARD];
+    let mut buf = vec![0u8; chunk + OVERLAP + TAIL_GUARD];
 
     loop {
         let i = cursor.fetch_add(1, Ordering::Relaxed);
         if i >= total {
             break;
         }
-        let base = i * CHUNK_SIZE;
+        let base = i * chunk;
         if base >= len {
             continue;
         }
-        let avail = (CHUNK_SIZE + OVERLAP).min(len - base);
+        let avail = (chunk + OVERLAP).min(len - base);
         file.read_exact_at(&mut buf[..avail], base as u64).expect("pread");
 
-        let Some((start, end)) = local_bounds(&buf[..avail], base, CHUNK_SIZE) else {
+        let Some((start, end)) = local_bounds(&buf[..avail], base, chunk) else {
             continue;
         };
         run_chunk(mode, &buf, start, end, &mut st);
@@ -404,6 +772,11 @@ fn main() {
     let threads =
         env::var("OBRC_THREADS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8);
     let reader = env::var("OBRC_READER").unwrap_or_else(|_| "pread".to_string());
+    let chunk = env::var("OBRC_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > MAX_LINE_LEN)
+        .unwrap_or(CHUNK_SIZE);
     let bits = env::var("OBRC_TABLE_BITS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -426,7 +799,7 @@ fn main() {
 
     let file = File::open(&path).unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
     let len = file.metadata().expect("stat").len() as usize;
-    let total = num_chunks(len, CHUNK_SIZE);
+    let total = num_chunks(len, chunk);
     let cursor = AtomicUsize::new(0);
 
     let start = Instant::now();
@@ -436,14 +809,16 @@ fn main() {
             let data = mapping.as_slice();
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads)
-                    .map(|_| scope.spawn(|| worker_mmap(&mode, bits, data, total, &cursor)))
+                    .map(|_| scope.spawn(|| worker_mmap(&mode, bits, data, chunk, total, &cursor)))
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         }
         "pread" => std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
-                .map(|_| scope.spawn(|| worker_pread(&mode, bits, &file, len, total, &cursor)))
+                .map(|_| {
+                    scope.spawn(|| worker_pread(&mode, bits, &file, len, chunk, total, &cursor))
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         }),
