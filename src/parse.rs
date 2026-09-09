@@ -64,6 +64,31 @@ pub fn parse_temp_branchless(d: &[u8], p: usize) -> (i16, usize) {
     (value as i16, p + (dot_bit as usize >> 3) + 3)
 }
 
+/// [`parse_temp_branchless`] for a caller that already knows where the line ends.
+///
+/// `len` is the byte count from `p` to the `\n`, which a delimiter bitmap yields for free.
+/// The legal layouts are `d.d`, `dd.d`, `-d.d` and `-dd.d`, and in every one the `.` sits at
+/// byte `len - 2` — including the two that share `len == 4`. The dot search therefore
+/// collapses to `28 - dot_bit` = `40 - 8 * len`, one subtract that does not wait on the load.
+///
+/// Reads 8 bytes from `p`, as [`parse_temp_branchless`] does. Returns no next index: the
+/// caller already has it.
+#[inline]
+pub fn parse_temp_len(d: &[u8], p: usize, len: usize) -> i16 {
+    let word = u64::from_le_bytes(d[p..p + 8].try_into().unwrap());
+
+    let signed = ((!word << 59) as i64) >> 63;
+    let masked = word & !((signed as u64) & 0xFF);
+    let v = masked << (40 - 8 * len as u32);
+
+    let tens = (v >> 8) & 0x0F;
+    let ones = (v >> 16) & 0x0F;
+    let frac = (v >> 32) & 0x0F;
+    let abs = (tens * 100 + ones * 10 + frac) as i64;
+
+    ((abs ^ signed) - signed) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +148,27 @@ mod tests {
                 assert_eq!(branchless, scalar, "parsing {s:?} with filler {filler:#04x}");
             }
         }
+    }
+
+    /// The length-driven form drops the dot search on the claim that `len - 2` always names
+    /// the same byte. That claim is the whole optimisation, so check it against the branchless
+    /// parser on every legal value and every filler, not just the four layouts.
+    #[test]
+    fn length_driven_agrees_with_the_dot_search() {
+        for (s, expected) in all_legal_values() {
+            for filler in [b'\n', b'x', b'0', b'9', b';', 0x00, 0xFF] {
+                let d = padded(&format!("{s}\n"), filler);
+                let got = parse_temp_len(&d, 0, s.len());
+                assert_eq!(got, expected, "value of {s:?} with filler {filler:#04x}");
+                assert_eq!(got, parse_temp_branchless(&d, 0).0, "{s:?}/{filler:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn length_driven_parses_at_a_nonzero_offset() {
+        let d = padded("Abha;-12.3\n", b'x');
+        assert_eq!(parse_temp_len(&d, 5, 5), -123);
     }
 
     #[test]

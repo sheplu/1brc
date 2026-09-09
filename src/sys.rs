@@ -10,6 +10,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 
 pub const PROT_READ: c_int = 0x01;
+pub const MAP_SHARED: c_int = 0x0001;
 pub const MAP_PRIVATE: c_int = 0x0002;
 
 pub const MADV_SEQUENTIAL: c_int = 2;
@@ -48,14 +49,19 @@ unsafe impl Sync for Mapping {}
 
 impl Mapping {
     pub fn open(path: &str) -> io::Result<Self> {
+        Self::open_with(path, MAP_PRIVATE)
+    }
+
+    /// [`Mapping::open`] with the mmap flags chosen by the caller, so `io_floor` can A/B
+    /// `MAP_PRIVATE` against `MAP_SHARED`. Read-only either way.
+    pub fn open_with(path: &str, flags: c_int) -> io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
             return Ok(Mapping { ptr: core::ptr::null_mut(), len: 0 });
         }
-        let ptr = unsafe {
-            mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
-        };
+        let ptr =
+            unsafe { mmap(core::ptr::null_mut(), len, PROT_READ, flags, file.as_raw_fd(), 0) };
         // mmap reports failure as (void *)-1, not NULL.
         if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
