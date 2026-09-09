@@ -1,0 +1,4 @@
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v13 t18	OBRC_THREADS=18 ./target/release/v13_hoist measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v13 t8	OBRC_THREADS=8 ./target/release/v13_hoist measurements.txt >/dev/null

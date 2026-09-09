@@ -179,6 +179,43 @@ pub fn scan_flat_keyed(data: &[u8], pos: usize) -> Option<(usize, u64, u64, u64)
     Some((pos + len, mix(prev, last), klo, khi))
 }
 
+/// [`scan_flat_keyed`] taking the 16-byte window instead of a slice and an index, and
+/// returning the name's *length* rather than the absolute position of the `;`.
+///
+/// Identical arithmetic; only the load differs. Building the two words from `data[pos..]`
+/// costs four compares and four branches to a panic, because nothing relates `pos` to
+/// `data.len()`. An `&[u8; 16]` carries that proof in the type, so the caller fetches the
+/// window once — one compare in `first_chunk` — and the scan checks nothing.
+///
+/// The body is duplicated rather than shared, for the reason given on
+/// [`parse_temp_branchless_win`](crate::parse::parse_temp_branchless_win);
+/// `win_agrees_with_the_slice_form` holds them equal.
+#[inline(always)]
+pub fn scan_flat_keyed_win(w: &[u8; 16]) -> Option<(usize, u64, u64, u64)> {
+    let w0 = u64::from_le_bytes(w[..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(w[8..].try_into().unwrap());
+    let m0 = semi_mask(w0);
+    let m1 = semi_mask(w1);
+
+    if m0 | m1 == 0 {
+        return None;
+    }
+
+    let len = if m0 != 0 {
+        (m0.trailing_zeros() >> 3) as usize
+    } else {
+        8 + (m1.trailing_zeros() >> 3) as usize
+    };
+
+    let keep = (1u64 << (8 * (len & 7))) - 1;
+    let short = len < 8;
+    let prev = if short { 0 } else { mix(0, w0) };
+    let last = if short { w0 } else { w1 } & keep;
+    let (klo, khi) = if short { (last, 0) } else { (w0, last) };
+
+    Some((len, mix(prev, last), klo, khi))
+}
+
 #[inline(always)]
 fn scan_flat(data: &[u8], pos: usize) -> (usize, u64) {
     match scan_flat_keyed(data, pos) {
@@ -306,6 +343,29 @@ mod tests {
         for (name, _) in STATIONS {
             check(name);
         }
+    }
+
+    /// [`scan_flat_keyed_win`] is a copy of [`scan_flat_keyed`] with a different load, kept
+    /// separate so that adding it cannot move the code v1..v12 already compile to. Copies
+    /// drift, so the equality is a test rather than a comment — over every name length the
+    /// window can see, every real station, and a window with no `;` at all.
+    #[test]
+    fn win_agrees_with_the_slice_form() {
+        let check = |d: &[u8]| {
+            let w: &[u8; 16] = d[..16].try_into().unwrap();
+            let want = scan_flat_keyed(d, 0).map(|(semi, h, klo, khi)| (semi, h, klo, khi));
+            let got = scan_flat_keyed_win(w).map(|(len, h, klo, khi)| (len, h, klo, khi));
+            assert_eq!(got, want, "{:?}", &d[..16]);
+        };
+
+        for len in 0..=100usize {
+            let name: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            check(&line(&name));
+        }
+        for (name, _) in STATIONS {
+            check(&line(name));
+        }
+        check(&[b'x'; 32]);
     }
 
     /// The window is read whole, so bytes past the `;` are in scope for the load even

@@ -38,11 +38,11 @@ use std::time::Instant;
 
 use obrc::block::{block_delims, block_newlines, block_semis, BLOCK};
 use obrc::chunk::{chunk_bounds, local_bounds, num_chunks, split_streams, CHUNK_SIZE};
-use obrc::inline_table::{InlineTable, KEY_SLACK};
-use obrc::parse::{parse_temp_branchless, parse_temp_len};
+use obrc::inline_table::{probe_words, Entry, InlineTable, KEY_SLACK};
+use obrc::parse::{parse_temp_branchless, parse_temp_branchless_win, parse_temp_len};
 use obrc::swar::{
     find_semi_and_hash, find_semi_and_hash_flat, find_semi_and_hash_flat_raw, hash_len_raw,
-    scan_flat_keyed, FLAT_SLACK,
+    scan_flat_keyed, scan_flat_keyed_win, FLAT_SLACK,
 };
 use obrc::sys::{set_thread_qos_user_interactive, Mapping};
 use obrc::table::Table;
@@ -173,6 +173,132 @@ fn full_keyed_long(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, us
     full_raw(data, table, pos)
 }
 
+/// [`full_keyed`] with its two fixed-size loads fetched as windows whose length the type
+/// system carries, so neither the scan nor the parse checks anything. Same table path, so the
+/// difference against `keyed` is exactly the bounds checks.
+///
+/// `data` is the whole buffer, which runs [`TAIL_GUARD`] past the last row, so a window that
+/// does not fit means the caller is off the end rather than that this row is unusual. Sending
+/// that to the same cold path the scan already uses for long names keeps the hot body to one
+/// exit.
+#[inline(always)]
+fn full_keyed_win(data: &[u8], table: &mut InlineTable, pos: usize) -> (u64, usize) {
+    let Some(row) = keyed_win(data, pos) else {
+        return full_keyed_long(data, table, pos);
+    };
+    let (len, h, klo, khi, v, next) = row;
+    table.upsert_words(data, pos, len, h, v, klo, khi);
+    (h, next)
+}
+
+/// The window half of [`full_keyed_win`], shared with [`step_hot`]: scan and parse, no table.
+///
+/// Returns the name length rather than the `;` position, which is what both callers want.
+#[inline(always)]
+fn keyed_win(data: &[u8], pos: usize) -> Option<(usize, u64, u64, u64, i16, usize)> {
+    let (len, h, klo, khi) = scan_flat_keyed_win(data.get(pos..)?.first_chunk()?)?;
+    let val = pos + len + 1;
+    let (v, adv) = parse_temp_branchless_win(data.get(val..)?.first_chunk()?);
+    Some((len, h, klo, khi, v, val + adv))
+}
+
+/// One row against slots borrowed out of the table, so the header stays in registers.
+///
+/// `None` means the row could not be finished here — a name too long for the window, or a
+/// probe that reached an empty slot — and in both cases **nothing has been written**. The
+/// caller drops the borrow and repeats the row through [`full_keyed`], which owns the table.
+#[inline(always)]
+fn step_hot<const WIN: bool>(
+    data: &[u8],
+    slots: &mut [Entry],
+    shift: u32,
+    pos: usize,
+) -> Option<(u64, usize)> {
+    let (len, h, klo, khi, v, next) = if WIN {
+        keyed_win(data, pos)?
+    } else {
+        let (semi, h, klo, khi) = scan_flat_keyed(data, pos)?;
+        let (v, next) = parse_temp_branchless(data, semi + 1);
+        (semi - pos, h, klo, khi, v, next)
+    };
+
+    debug_assert!(len < 16);
+    debug_assert_eq!(
+        obrc::inline_table::key_from_words(klo, khi),
+        obrc::inline_table::probe_key(data, pos, len)
+    );
+
+    let key_lo = (klo as u128) | ((khi as u128) << 64);
+    probe_words(slots, shift, h, key_lo, v).then_some((h, next))
+}
+
+/// [`streamed`] with the table's slots and shift held in registers across a run of rows.
+///
+/// The borrow is what buys the codegen. `upsert_words` keeps `&mut InlineTable` live across an
+/// `insert` that may reallocate `entries`, so LLVM reloads `shift`, `entries.ptr`,
+/// `entries.len` and `mask` from the frame on every row. Handing out the slice proves that
+/// cannot happen, and all four hoist out of the loop.
+///
+/// The price is that a row which has to insert cannot run under the borrow. [`step_hot`]
+/// returns `None` having written nothing, the run ends, the borrow drops, and that one row is
+/// redone through `full_keyed`. Once per distinct station — 413 times per thread over the
+/// whole file — so the repeated scan is not a cost. Streams that already advanced in the
+/// interrupted batch simply continue from where they are.
+#[inline(always)]
+fn streamed_hot<const N: usize, const WIN: bool>(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    acc: &mut u64,
+    n: &mut u64,
+    table: &mut InlineTable,
+) {
+    let (mut a, mut rows) = (*acc, *n);
+    let mut s = split_streams::<N>(data, start, end);
+
+    loop {
+        // `N` when the interleaved loop ran out of rows, otherwise the stream that missed.
+        let cold = {
+            let (slots, shift) = table.hot_slots();
+            'run: loop {
+                let mut all = true;
+                for k in 0..N {
+                    all &= s[k].0 < s[k].1;
+                }
+                if !all {
+                    break 'run N;
+                }
+                for k in 0..N {
+                    let Some((v, next)) = step_hot::<WIN>(data, slots, shift, s[k].0) else {
+                        break 'run k;
+                    };
+                    a ^= v;
+                    s[k].0 = next;
+                    rows += 1;
+                }
+            }
+        };
+        if cold == N {
+            break;
+        }
+        let (v, next) = full_keyed(data, table, s[cold].0);
+        a ^= v;
+        s[cold].0 = next;
+        rows += 1;
+    }
+
+    // The few rows past the point where the first stream ran dry, as in `streamed`.
+    for k in 0..N {
+        while s[k].0 < s[k].1 {
+            let (v, next) = full_keyed(data, table, s[k].0);
+            a ^= v;
+            s[k].0 = next;
+            rows += 1;
+        }
+    }
+    (*acc, *n) = (a, rows);
+}
+
 /// One row's work, as a trait rather than a closure or a fn item.
 ///
 /// Both of those reach the driver through a compiler-generated `Fn::call` shim, and nothing can
@@ -226,6 +352,7 @@ step!(FullInline, InlineTable, full_inline);
 step!(FullFlat, InlineTable, full_flat);
 step!(FullRaw, InlineTable, full_raw);
 step!(FullKeyed, InlineTable, full_keyed);
+step!(FullKeyedWin, InlineTable, full_keyed_win);
 
 struct RowFlat;
 impl Row for RowFlat {
@@ -601,7 +728,8 @@ impl State {
             _ => 0,
         };
         let inline_bits =
-            if ["itable", "flat", "raw", "keyed", "nltable", "dltable", "dlnokey", "dlnostats"]
+            if ["itable", "flat", "raw", "keyed", "win", "hdr", "hot", "nltable", "dltable",
+                "dlnokey", "dlnostats"]
                 .iter()
                 .any(|p| mode.starts_with(p))
             {
@@ -708,6 +836,16 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
         "keyed5" => once(|| streamed::<5>(data, pos, end, acc, n, FullKeyed(itable))),
         "keyed6" => once(|| streamed::<6>(data, pos, end, acc, n, FullKeyed(itable))),
         "keyed8" => once(|| streamed::<8>(data, pos, end, acc, n, FullKeyed(itable))),
+        // The two halves of v13, and both together. Every one of these must leave `acc` and
+        // `n` equal to `keyed2`'s — they change how the bytes are reached, not what is read.
+        "win2" => once(|| streamed::<2>(data, pos, end, acc, n, FullKeyedWin(itable))),
+        "win3" => once(|| streamed::<3>(data, pos, end, acc, n, FullKeyedWin(itable))),
+        "hdr2" => once(|| streamed_hot::<2, false>(data, pos, end, acc, n, itable)),
+        "hdr3" => once(|| streamed_hot::<3, false>(data, pos, end, acc, n, itable)),
+        "hot1" => once(|| streamed_hot::<1, true>(data, pos, end, acc, n, itable)),
+        "hot2" => once(|| streamed_hot::<2, true>(data, pos, end, acc, n, itable)),
+        "hot3" => once(|| streamed_hot::<3, true>(data, pos, end, acc, n, itable)),
+        "hot4" => once(|| streamed_hot::<4, true>(data, pos, end, acc, n, itable)),
         "split2" => once(|| streamed_split::<2>(data, pos, end, acc, n, split)),
         "split4" => once(|| streamed_split::<4>(data, pos, end, acc, n, split)),
         "split8" => once(|| streamed_split::<8>(data, pos, end, acc, n, split)),
