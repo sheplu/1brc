@@ -15,10 +15,15 @@
 //! streams, which isolates how much of the cost is the loop-carried dependency and how much
 //! is the table's load/store aliasing.
 //!
-//! `OBRC_READER` picks how the bytes arrive: `pread` (default, what v8 ships) or `mmap`.
-//! The reader is not a detail of the harness — v8 exists because swapping it was worth
-//! 0.2 s, and the two put the parse loop under different memory behaviour. A mode is only
+//! `OBRC_READER` picks how the bytes arrive: `pread` (default, what v8 ships), `mmap`, or
+//! `mmap_warm`. The reader is not a detail of the harness — v8 exists because swapping it was
+//! worth 0.2 s, and the two put the parse loop under different memory behaviour. A mode is only
 //! comparable to another mode measured with the same reader.
+//!
+//! `mmap_warm` is `mmap` with every page faulted in *before* the clock starts. No real version
+//! could do that — the faults are work — so it is a decomposition and never a result: it prices
+//! the parse loop running over resident pages, which is the floor of any design that parses the
+//! mapping in place instead of copying it into a buffer.
 //!
 //! `itable3` is v8's engine exactly, so `itable3 - io_floor` is the compute budget any new
 //! technique has to attack.
@@ -695,7 +700,14 @@ fn run_chunk(mode: &str, data: &[u8], start: usize, end: usize, st: &mut State) 
         "raw2" => once(|| streamed::<2>(data, pos, end, acc, n, FullRaw(itable))),
         "raw3" => once(|| streamed::<3>(data, pos, end, acc, n, FullRaw(itable))),
         "raw4" => once(|| streamed::<4>(data, pos, end, acc, n, FullRaw(itable))),
+        // v11 freed the registers the 32-byte probe key used to spill, so the stream count
+        // that lost for v7 is worth asking again.
+        "keyed2" => once(|| streamed::<2>(data, pos, end, acc, n, FullKeyed(itable))),
         "keyed3" => once(|| streamed::<3>(data, pos, end, acc, n, FullKeyed(itable))),
+        "keyed4" => once(|| streamed::<4>(data, pos, end, acc, n, FullKeyed(itable))),
+        "keyed5" => once(|| streamed::<5>(data, pos, end, acc, n, FullKeyed(itable))),
+        "keyed6" => once(|| streamed::<6>(data, pos, end, acc, n, FullKeyed(itable))),
+        "keyed8" => once(|| streamed::<8>(data, pos, end, acc, n, FullKeyed(itable))),
         "split2" => once(|| streamed_split::<2>(data, pos, end, acc, n, split)),
         "split4" => once(|| streamed_split::<4>(data, pos, end, acc, n, split)),
         "split8" => once(|| streamed_split::<8>(data, pos, end, acc, n, split)),
@@ -729,6 +741,33 @@ fn worker_mmap(
         run_chunk(mode, data, start, end, &mut st);
     }
     st
+}
+
+/// Faults every page of `data` in, on `threads` threads, and returns the seconds it took.
+///
+/// One read per 16 KB page installs the PTE; the byte is discarded, so the read has to be
+/// `volatile` or it is not a read at all. Threads take contiguous spans rather than striding
+/// through each other's pages, which is both what a real pre-faulter would do and what keeps
+/// the kernel's own clustering working with us.
+fn prefault(data: &[u8], threads: usize) -> f64 {
+    const PAGE: usize = 16384;
+    let t0 = Instant::now();
+    let span = data.len().div_ceil(threads.max(1));
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let lo = (t * span).min(data.len());
+            let part = &data[lo..(lo + span).min(data.len())];
+            scope.spawn(move || {
+                set_thread_qos_user_interactive();
+                let mut p = 0;
+                while p < part.len() {
+                    unsafe { core::ptr::read_volatile(part.as_ptr().add(p)) };
+                    p += PAGE;
+                }
+            });
+        }
+    });
+    t0.elapsed().as_secs_f64()
 }
 
 /// v8's reader: one recycled buffer per thread, `pread` per chunk. The buffer's slack past
@@ -802,11 +841,23 @@ fn main() {
     let total = num_chunks(len, chunk);
     let cursor = AtomicUsize::new(0);
 
+    let map = || Mapping::open(&path).unwrap_or_else(|e| panic!("cannot map {path}: {e}"));
+
+    // Deliberately ahead of the clock, and only for `mmap_warm`: the point of that reader is to
+    // price the parse loop over pages that are already resident, so the faults have to happen
+    // where they are not counted. The prefault cost is reported separately and is real work that
+    // any shipped version would still owe.
+    let warm = (reader == "mmap_warm").then(map);
+    if let Some(m) = &warm {
+        eprintln!("  prefault {:.3} s (not timed)", prefault(m.as_slice(), threads));
+    }
+
     let start = Instant::now();
     let states: Vec<State> = match reader.as_str() {
-        "mmap" => {
-            let mapping = Mapping::open(&path).unwrap_or_else(|e| panic!("cannot map {path}: {e}"));
-            let data = mapping.as_slice();
+        "mmap" | "mmap_warm" => {
+            // `mmap` maps inside the timed region, as a real version would have to.
+            let cold = warm.is_none().then(map);
+            let data = warm.as_ref().or(cold.as_ref()).expect("mapped either side").as_slice();
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads)
                     .map(|_| scope.spawn(|| worker_mmap(&mode, bits, data, chunk, total, &cursor)))
@@ -822,7 +873,7 @@ fn main() {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         }),
-        other => panic!("unknown reader {other:?}, expected mmap or pread"),
+        other => panic!("unknown reader {other:?}, expected pread, mmap or mmap_warm"),
     };
     let secs = start.elapsed().as_secs_f64();
 

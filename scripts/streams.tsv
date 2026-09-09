@@ -1,0 +1,12 @@
+# does v11's freed register budget make more streams pay? warm arm = compute only
+keyed1 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed
+keyed2 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2
+keyed3 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed3
+keyed4 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed4
+keyed5 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed5
+keyed6 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed6
+keyed8 warm	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed8
+keyed2 pread	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor keyed2
+keyed3 pread	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor keyed3
+keyed4 pread	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor keyed4
+keyed5 pread	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor keyed5

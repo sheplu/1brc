@@ -46,6 +46,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use obrc::chunk::{local_bounds, num_chunks, split_streams, CHUNK_SIZE};
 use obrc::inline_table::{InlineTable, KEY_SLACK};
@@ -91,6 +92,18 @@ fn step_long(buf: &[u8], table: &mut InlineTable, pos: usize) -> usize {
     next
 }
 
+/// What one worker spent its life on. Three `Instant::now()` per 2 MiB chunk is ~370 chunks a
+/// thread and under 30 µs all told, so this is measured unconditionally and only *reported*
+/// under `OBRC_PHASES`. Reading and parsing are strictly serialized within a thread, so the two
+/// do add up — the interesting quantity is the ratio, and how far the slowest thread runs past
+/// the fastest.
+#[derive(Default, Clone, Copy)]
+struct Spent {
+    read: Duration,
+    parse: Duration,
+    total: Duration,
+}
+
 fn worker(
     file: &File,
     len: usize,
@@ -98,10 +111,12 @@ fn worker(
     bits: u32,
     cursor: &AtomicUsize,
     total: usize,
-) -> InlineTable {
+) -> (InlineTable, Spent) {
+    let t_start = Instant::now();
     set_thread_qos_user_interactive();
     let mut table = InlineTable::new(bits);
     let mut buf = vec![0u8; chunk + OVERLAP + TAIL_GUARD];
+    let mut spent = Spent::default();
 
     loop {
         let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -113,7 +128,10 @@ fn worker(
             continue;
         }
         let avail = (chunk + OVERLAP).min(len - base);
+        let t0 = Instant::now();
         file.read_exact_at(&mut buf[..avail], base as u64).expect("pread");
+        let t1 = Instant::now();
+        spent.read += t1 - t0;
         let view = &buf[..avail];
 
         let Some((start, end)) = local_bounds(view, base, chunk) else {
@@ -140,11 +158,14 @@ fn worker(
                 s[k].0 = step(&buf, &mut table, s[k].0);
             }
         }
+        spent.parse += t1.elapsed();
     }
-    table
+    spent.total = t_start.elapsed();
+    (table, spent)
 }
 
 fn main() {
+    let t_main = Instant::now();
     let path = env::args().nth(1).unwrap_or_else(|| "measurements.txt".to_string());
     let threads =
         env::var("OBRC_THREADS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8);
@@ -166,25 +187,73 @@ fn main() {
     let total = num_chunks(len, chunk);
     let cursor = AtomicUsize::new(0);
 
-    let tables = std::thread::scope(|scope| {
+    let t_setup = t_main.elapsed();
+
+    let results = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| scope.spawn(|| worker(&file, len, chunk, bits, &cursor, total)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
     });
+    let t_workers = t_main.elapsed();
 
     let mut merged: BTreeMap<&[u8], Stats> = BTreeMap::new();
-    for t in &tables {
+    for (t, _) in &results {
         for (name, stats) in t.iter() {
             merged.entry(name).and_modify(|s| s.merge(&stats)).or_insert(stats);
         }
     }
 
     let entries: Vec<(Vec<u8>, Stats)> = merged.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+    let t_merge = t_main.elapsed();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     write_results(&mut out, &entries).unwrap();
     out.flush().unwrap();
+    let t_out = t_main.elapsed();
+
+    if env::var_os("OBRC_PHASES").is_some() {
+        report_phases(&results, t_setup, t_workers, t_merge, t_out);
+    }
+    // Deliberate: 18 tables, each with a key arena, would otherwise be walked and freed here
+    // for no purpose. That teardown is part of the wall clock a benchmark sees.
     std::process::exit(0);
+}
+
+/// Prints where the run went. Everything is measured from the top of `main`, so the gap between
+/// `t_out` and the wall clock a benchmark reports is `exec` plus dynamic linking plus teardown —
+/// real cost that no in-process timer can see.
+fn report_phases(
+    results: &[(InlineTable, Spent)],
+    t_setup: Duration,
+    t_workers: Duration,
+    t_merge: Duration,
+    t_out: Duration,
+) {
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let mut spent: Vec<Spent> = results.iter().map(|(_, s)| *s).collect();
+
+    eprintln!("  setup (open+stat)   {:7.1} ms", ms(t_setup));
+    eprintln!("  workers             {:7.1} ms", ms(t_workers - t_setup));
+    eprintln!("  merge               {:7.1} ms", ms(t_merge - t_workers));
+    eprintln!("  output              {:7.1} ms", ms(t_out - t_merge));
+    eprintln!("  --- from main entry {:7.1} ms", ms(t_out));
+
+    // Per-thread, so these are core-milliseconds and sum to more than the wall clock.
+    let sum = |f: fn(&Spent) -> Duration| spent.iter().map(|s| ms(f(s))).sum::<f64>();
+    let n = spent.len() as f64;
+    eprintln!(
+        "  per thread, mean of {}: read {:.1} ms, parse {:.1} ms  ({:.0}% read)",
+        spent.len(),
+        sum(|s| s.read) / n,
+        sum(|s| s.parse) / n,
+        100.0 * sum(|s| s.read) / (sum(|s| s.read) + sum(|s| s.parse)),
+    );
+
+    // A thread that finishes early has idled while another still held a chunk. The spread is
+    // the load imbalance, and it is wall clock nobody can use.
+    spent.sort_by_key(|s| s.total);
+    let (lo, hi) = (ms(spent[0].total), ms(spent[spent.len() - 1].total));
+    eprintln!("  thread lifetime     {lo:7.1} .. {hi:.1} ms  (straggler costs {:.1} ms)", hi - lo);
 }
