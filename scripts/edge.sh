@@ -54,6 +54,24 @@ w("utf8.txt", "".join(f"{n};{i}.5\n" for i, n in enumerate(
 # Names sharing a 40-byte prefix, so a prefix-only comparison would merge them.
 w("shared_prefix.txt", "".join(f"{'p'*40}{s};{i}.0\n" for i, s in enumerate("abcde")) * 3)
 
+# A name of exactly 32 bytes fills the inline key with no room for a terminating zero, so it
+# is indistinguishable from the first 32 bytes of any longer name and has to fall back to
+# comparing lengths. Every 32-byte name here is written *after* the longer names it shares its
+# key with: it is the query's length that decides whether the probe takes the fallback, so the
+# other order tests nothing.
+#
+# Sized by experiment, not by derivation. A short name only meets its longer namesakes if the
+# hash puts them in one probe chain, and the table grows to stay under half full, so the
+# expected number of such meetings is ~1 no matter how large the input. Below 24k rows this
+# catches v10 and v11 but not v6..v9, whose hash still carries its avalanche and lands the
+# short names elsewhere. The deterministic guard is
+# `a_name_that_exactly_fills_the_key_is_not_confused_with_a_longer_one` in inline_table.rs,
+# which forces the hash collision outright; this is the end-to-end confirmation.
+_prefixes = [chr(c) * 32 for c in range(ord("a"), ord("z") + 1)]
+w("inline_key_exact.txt",
+  "".join(f"{p}{i:06d};{i%100}.{i%10}\n" for p in _prefixes for i in range(24000 // 26)) +
+  "".join(f"{p};1.0\n" for p in _prefixes))
+
 PAGE = 16384
 
 def pad_to_page(body, tail=""):

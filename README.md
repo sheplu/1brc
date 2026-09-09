@@ -308,6 +308,16 @@ The interesting failures here are arithmetic, not performance.
 - **No `-0.0`.** The printed sign comes from the rounded tenths integer, never from `sum < 0`.
 - **A hash match is never a key match**, and neither is a 16-byte prefix. The full name is always
   compared. With 10,000 names permitted, anything less would be relying on the dataset.
+- **The inline key's length bound is strict, and this is where the argument went wrong.** The table
+  skips comparing lengths because a name zero-padded to 32 bytes determines its own length. That is
+  true *below* 32 and false *at* 32, where the padding disappears and the key becomes the first 32
+  bytes of every longer name that starts the same way. The guard read `len <= INLINE_KEY` from v6
+  through v11, so a 32-byte name arriving after a longer namesake merged into it and vanished from
+  the output. It never fired here — the longest official name is 26 — but the spec allows 100, and
+  the point of the sentence above is not to rely on that. The prefix-chain test missed it because it
+  only ever walked short-to-long, and the flaw is one-directional: the *query's* length is what
+  decides whether the fallback is taken. Fixed; the test now walks both ways, `scripts/edge.sh` grew
+  an input that reaches it end to end, and a unit test forces the hash collision outright.
 - **Out-of-bounds reads.** The hot loop reads up to 32 bytes past the current row. Interior chunks
   legitimately over-read into the next one; the hazard is the last chunk when the file size is an
   exact multiple of the 16 KB page, where reading past EOF leaves the mapping. The real dataset does
@@ -315,11 +325,11 @@ The interesting failures here are arithmetic, not performance.
 
 Testing, in rough order of how much it caught:
 
-- `scripts/edge.sh` — 12 hand-built inputs (single row, no trailing newline, exact page multiples
+- `scripts/edge.sh` — 13 hand-built inputs (single row, no trailing newline, exact page multiples
   including one ending in a 100-byte name, multi-byte UTF-8, names straddling the 16- and 32-byte
   inline-key seams, 40-byte shared prefixes, every rounding extreme) run through all ten fast
   versions against the oracle.
-- `cargo test` — 55 tests. The parser is proved by exhaustion: all 1999 legal temperature strings
+- `cargo test` — 56 tests. The parser is proved by exhaustion: all 1999 legal temperature strings
   against a reference parse, each with seven different trailing fillers in the 8-byte load. The
   chunk splitter is checked at every chunk size against a full-coverage invariant, and v8's
   local-only boundary rule is asserted equal to the global one for every chunk at every size.

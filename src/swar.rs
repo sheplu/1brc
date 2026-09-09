@@ -101,7 +101,7 @@ pub fn find_semi_and_hash_flat(data: &[u8], pos: usize) -> (usize, u64) {
 /// [`find_semi_and_hash_flat`] without the final avalanche.
 ///
 /// `mix` ends in a multiply, so the *high* bits of what it returns are already well mixed
-/// and [`finalize`] only buys spread in the low ones. A table that takes its slot from the
+/// and `finalize` only buys spread in the low ones. A table that takes its slot from the
 /// high bits does not need it, and skipping it removes five operations from the dependency
 /// chain that ends at the table load. The result is not a general-purpose hash: use it only
 /// where the index comes off the top.

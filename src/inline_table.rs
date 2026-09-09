@@ -153,14 +153,17 @@ impl InlineTable {
     /// A hash match is never taken as a key match: the full name is always compared.
     ///
     /// **Why the length is not compared, and why the slot needs no occupancy flag.** Station
-    /// names hold no NUL, so a name of `len <= INLINE_KEY` zero-padded to [`INLINE_KEY`] bytes
-    /// determines both the bytes and the length: a shorter name has a zero where a longer one
-    /// has a name byte, and a name too long to fit inline fills all 32 with non-zero. The key
-    /// alone therefore settles the match for every name this dataset contains, and only two
-    /// names sharing a 32-byte prefix need `len` — which is exactly when `tail_eq` runs anyway.
-    /// The same argument makes an all-zero key impossible for a live entry, so `Default` marks
-    /// an empty slot and the hot compare rejects it for free. Together that removes a load and
-    /// two compares from in front of the accumulate.
+    /// names hold no NUL, so a name of `len < INLINE_KEY` zero-padded to [`INLINE_KEY`] bytes
+    /// determines both the bytes and the length: it has a zero at index `len`, where a longer
+    /// name has either a name byte or, at `len == INLINE_KEY` and above, no zero at all. The key
+    /// alone therefore settles the match for every name this dataset contains — the longest is
+    /// 26 — and the same argument makes an all-zero key impossible for a live entry, so `Default`
+    /// marks an empty slot and the hot compare rejects it for free.
+    ///
+    /// The bound is strict, and that is the whole of it: a name of *exactly* [`INLINE_KEY`] bytes
+    /// fills the key with non-zero and so is indistinguishable from the first 32 bytes of any
+    /// longer name. It gets the length check and the tail compare like the longer names it can be
+    /// confused with — `tail_eq` then compares an empty range, and `e.len` does the work.
     ///
     /// `#[inline(always)]`, with the insert outlined to keep this small enough to deserve it.
     /// Under a plain `#[inline]` the whole body sat right at LLVM's size threshold, so whether
@@ -179,7 +182,7 @@ impl InlineTable {
         loop {
             let e = &self.entries[idx];
             if e.key == key {
-                if len <= INLINE_KEY
+                if len < INLINE_KEY
                     || (e.len as usize == len
                         && tail_eq(&self.keys, e.key_off as usize, data, off, len))
                 {
@@ -261,7 +264,7 @@ impl InlineTable {
     /// the results are wrong. Prices everything the key costs, the two masked loads included.
     ///
     /// With no key there is no all-zero-key sentinel either, so occupancy falls back to `len`.
-    /// The accumulate is `upsert`'s, [`widen`] included — otherwise the difference between the
+    /// The accumulate is `upsert`'s, `widen` included — otherwise the difference between the
     /// two would price the store-free common path as well as the key.
     #[inline(always)]
     pub fn upsert_no_key(&mut self, data: &[u8], off: usize, len: usize, hash: u64, value: i16) {
@@ -297,7 +300,7 @@ impl InlineTable {
         loop {
             let e = &self.entries[idx];
             if e.key == key {
-                if len <= INLINE_KEY
+                if len < INLINE_KEY
                     || (e.len as usize == len
                         && tail_eq(&self.keys, e.key_off as usize, data, off, len))
                 {
@@ -377,6 +380,10 @@ fn widen(e: &mut Entry, value: i16) {
 
 /// Compares the part of a name that does not fit inline: the stored copy in `keys` against
 /// the probe in `data`. Cold — no name in the official list is long enough to reach it.
+///
+/// Called at `len == INLINE_KEY` too, where the range is empty and it trivially agrees; there
+/// the caller's `e.len` check is what separates the name from the longer ones it shares a key
+/// with.
 #[cold]
 #[inline(never)]
 fn tail_eq(keys: &[u8], stored: usize, data: &[u8], off: usize, len: usize) -> bool {
@@ -464,14 +471,53 @@ mod tests {
     /// zero-padded key. That holds only while names contain no NUL, and the case it protects is
     /// a name that is a strict prefix of another. Check a whole prefix chain, including the one
     /// that runs across the 32-byte seam where the inline key stops covering the name.
+    ///
+    /// Both directions. Whether the shorter or the longer name is the *query* decides which
+    /// one's length the probe gets to see, so a chain walked only short-to-long tests half the
+    /// property — which is how the `len <= INLINE_KEY` off-by-one survived here.
     #[test]
     fn a_name_is_never_confused_with_its_own_prefixes() {
         let base = "Sankt_Peterburg_Oblast_Station_Nord";
         let names: Vec<String> = (1..=base.len()).map(|n| base[..n].to_string()).collect();
-        let refs: Vec<(&str, i16)> = names.iter().map(|n| (n.as_str(), 1i16)).collect();
-        let t = run(&refs, 8);
-        assert_eq!(t.len(), names.len(), "prefixes merged into one entry");
-        assert!(collect(&t).values().all(|&s| s == (1, 1, 1, 1)));
+        let mut refs: Vec<(&str, i16)> = names.iter().map(|n| (n.as_str(), 1i16)).collect();
+
+        for _ in 0..2 {
+            let t = run(&refs, 8);
+            assert_eq!(t.len(), names.len(), "prefixes merged into one entry");
+            assert!(collect(&t).values().all(|&s| s == (1, 1, 1, 1)));
+            refs.reverse();
+        }
+    }
+
+    /// A name of *exactly* [`INLINE_KEY`] bytes fills the key with non-zero, so it is
+    /// indistinguishable from the prefix of any longer name — the one length at which the
+    /// zero-padding argument above does not hold. It must therefore take the tail compare like
+    /// any other long name.
+    ///
+    /// Only the order below catches it: inserting the 32-byte name first makes the longer one
+    /// the query, and the longer one does compare lengths. Inserting the longer one first makes
+    /// the 32-byte name the query, and it is the query's length that decides whether the guard
+    /// is skipped. The prefix chain above only ever runs short-to-long.
+    #[test]
+    fn a_name_that_exactly_fills_the_key_is_not_confused_with_a_longer_one() {
+        let short = "Sankt_Peterburg_Oblast_Station_N";
+        let long = "Sankt_Peterburg_Oblast_Station_Nord";
+        assert_eq!(short.len(), INLINE_KEY);
+        assert_eq!(&long[..INLINE_KEY], short);
+
+        // Both orders, and a forced hash collision so the probe cannot avoid the comparison by
+        // landing elsewhere — that is the case the key compare exists for.
+        for recs in [[(long, 1i16), (short, 2i16)], [(short, 2i16), (long, 1i16)]] {
+            let (data, spans) = layout(&recs);
+            let mut t = InlineTable::new(8);
+            for (i, (name, value)) in recs.iter().enumerate() {
+                t.upsert(&data, spans[i].0, name.len(), 0xdead_beef_0000_0000, *value);
+            }
+            let got = collect(&t);
+            assert_eq!(t.len(), 2, "{recs:?} merged into one entry");
+            assert_eq!(got[short], (2, 2, 2, 1));
+            assert_eq!(got[long], (1, 1, 1, 1));
+        }
     }
 
     /// Exercises the `len > INLINE_KEY` fallback, including names that are identical for
