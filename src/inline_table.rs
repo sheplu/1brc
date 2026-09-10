@@ -31,16 +31,21 @@ pub const INLINE_KEY: usize = 32;
 /// Readable bytes the probe requires from the start of a name.
 pub const KEY_SLACK: usize = INLINE_KEY;
 
-/// One cache line. Two entries never share a line, so a probe touches exactly one.
+/// 64 bytes, 64-byte aligned — *not* a cache line. This machine's line is 128 bytes, so two
+/// entries always share one. That is harmless here and mildly useful: the table is per-thread,
+/// so there is no false sharing, and a linear probe's next slot arrives with the current one.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 pub struct Entry {
     /// The name's first [`INLINE_KEY`] bytes, zero beyond `len`. All-zero means the slot is
     /// empty — see [`upsert`](InlineTable::upsert) for why no real name can look like that.
     key: [u128; 2],
-    /// `sum`..`max` are the only fields a repeat row touches, so they are kept adjacent and
-    /// 16-byte aligned: the accumulate is then one load pair and one store pair, not four of
-    /// each scattered across the line.
+    /// `sum`..`max` are the only fields a repeat row touches, so they are kept adjacent. The
+    /// accumulate is still four loads and two stores: `sum` and `count` differ in width, so
+    /// nothing pairs. Widening `count` to `u64` to make them pair was tried — LLVM answered
+    /// with one `ldr q`/`str q` instead of an `ldp`/`stp`, halving the memory ops for the same
+    /// instruction count, and the clock moved 6 ms of 402. Not worth truncating the stored
+    /// hash to pay for it.
     sum: i64,
     count: u32,
     min: i16,
@@ -50,7 +55,7 @@ pub struct Entry {
     len: u32,
     /// Only [`grow`](InlineTable::grow) reads this, to re-slot the entry without having to
     /// re-hash a name it would first have to reassemble. The other 56 bytes leave exactly
-    /// this much padding in the cache line, so carrying it is free.
+    /// this much padding, so carrying it is free.
     hash: u64,
 }
 
@@ -259,6 +264,22 @@ impl InlineTable {
         self.insert(data, off, len, hash, value, [key_lo, 0], idx);
     }
 
+    /// The slots and the shift, borrowed, for a caller that wants to keep them in registers.
+    ///
+    /// [`upsert_words`](Self::upsert_words) cannot: `&mut self` stays live across `insert`,
+    /// which may [`grow`](Self::grow) and replace `entries`, so every row reloads `shift`,
+    /// `entries.ptr`, `entries.len` and `mask` from the frame — four stack loads, one of them
+    /// on the address-generation chain that ends at the entry's cache line.
+    ///
+    /// Handing out the slice moves that proof to the borrow checker. While the borrow is live
+    /// nothing can reallocate, so the four values are loop-invariant and hoist out. The caller
+    /// pays for it by having to drop the borrow to insert, which is what
+    /// [`probe_words`] returning `false` is for.
+    #[inline(always)]
+    pub fn hot_slots(&mut self) -> (&mut [Entry], u32) {
+        (&mut self.entries, self.shift)
+    }
+
     /// [`upsert`](Self::upsert) with the key dropped entirely — no [`probe_key`], no compare,
     /// slots matched on length alone. Ablation only: distinct names of equal length merge, so
     /// the results are wrong. Prices everything the key costs, the two masked loads included.
@@ -368,9 +389,51 @@ impl InlineTable {
     }
 }
 
-/// Extends an entry's range. Out of line so the common row pays no store; see [`upsert`].
+/// [`upsert_words`](InlineTable::upsert_words) against slots borrowed out of the table with
+/// [`hot_slots`](InlineTable::hot_slots).
 ///
-/// [`upsert`]: InlineTable::upsert
+/// `false` means the probe reached an empty slot, and **nothing was written** — the caller drops
+/// the borrow and repeats the row through `upsert_words`, which owns the table and may insert
+/// and grow. At most once per distinct station, so the repeat is not a cost.
+///
+/// The mask is derived from `slots.len()` rather than passed in, and that is the point: `x & m`
+/// where `m == len - 1` is provably `< len`, so neither the initial slot nor the probe's
+/// back-edge needs a bounds check. Two unrelated arguments would prove nothing, which is why the
+/// `self.mask` field cannot do this. [`grow`](InlineTable::grow) already demonstrates the shape —
+/// it probes with a local `mask = cap - 1` against a slice of length `cap` and compiles without a
+/// check, while `upsert_words`, reading the same value from a field, gets one.
+///
+/// Masking the initial slot is free: [`slot`] shifts by `64 - bits` and the table holds
+/// `1 << bits` slots, so the result is already in range and the `and` only makes that visible.
+///
+/// A free function rather than a method, so that adding it leaves the mangled names of every
+/// existing method — and therefore the disassembly v1..v12 are compared against — untouched.
+#[inline(always)]
+pub fn probe_words(slots: &mut [Entry], shift: u32, hash: u64, key_lo: u128, value: i16) -> bool {
+    debug_assert!(slots.len().is_power_of_two());
+    let mask = slots.len() - 1;
+    let mut idx = slot(hash, shift) & mask;
+
+    loop {
+        let e = &slots[idx];
+        if e.key[0] == key_lo {
+            let e = &mut slots[idx];
+            e.sum += value as i64;
+            e.count += 1;
+            if ((value as i32 - e.min as i32) | (e.max as i32 - value as i32)) < 0 {
+                widen(e, value);
+            }
+            return true;
+        }
+        if e.key[0] == 0 {
+            return false;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+/// Extends an entry's range. Out of line so the common row pays no store; see
+/// [`upsert`](InlineTable::upsert).
 #[cold]
 #[inline(never)]
 fn widen(e: &mut Entry, value: i16) {

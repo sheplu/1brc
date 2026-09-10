@@ -1,0 +1,35 @@
+# The two sweeps the README quotes from batches of their own, re-run on the v14 build (1 MiB
+# chunk, +cssc). Both were measured before those landed, and a build change is a stronger
+# objection to a stale number than batch drift is.
+#
+# v8 against v9 across thread counts: does the win still shrink as threads are added?
+v8 t6	OBRC_THREADS=6 ./target/release/v8_pread measurements.txt
+v9 t6	OBRC_THREADS=6 ./target/release/v9_flatscan measurements.txt
+v8 t8	OBRC_THREADS=8 ./target/release/v8_pread measurements.txt
+v9 t8	OBRC_THREADS=8 ./target/release/v9_flatscan measurements.txt
+v8 t12	OBRC_THREADS=12 ./target/release/v8_pread measurements.txt
+v9 t12	OBRC_THREADS=12 ./target/release/v9_flatscan measurements.txt
+v8 t14	OBRC_THREADS=14 ./target/release/v8_pread measurements.txt
+v9 t14	OBRC_THREADS=14 ./target/release/v9_flatscan measurements.txt
+v8 t16	OBRC_THREADS=16 ./target/release/v8_pread measurements.txt
+v9 t16	OBRC_THREADS=16 ./target/release/v9_flatscan measurements.txt
+v8 t18	OBRC_THREADS=18 ./target/release/v8_pread measurements.txt
+v9 t18	OBRC_THREADS=18 ./target/release/v9_flatscan measurements.txt
+
+# Table size, whole binary at 18 threads. The claim under test is that it is flat from 2^13 up
+# and worse below, so the 2^14 default is chosen for footprint rather than speed.
+bits11	OBRC_THREADS=18 OBRC_TABLE_BITS=11 ./target/release/v12_pairs measurements.txt
+bits12	OBRC_THREADS=18 OBRC_TABLE_BITS=12 ./target/release/v12_pairs measurements.txt
+bits13	OBRC_THREADS=18 OBRC_TABLE_BITS=13 ./target/release/v12_pairs measurements.txt
+bits14	OBRC_THREADS=18 OBRC_TABLE_BITS=14 ./target/release/v12_pairs measurements.txt
+bits15	OBRC_THREADS=18 OBRC_TABLE_BITS=15 ./target/release/v12_pairs measurements.txt
+bits16	OBRC_THREADS=18 OBRC_TABLE_BITS=16 ./target/release/v12_pairs measurements.txt
+
+# Pushing the read floor lower. Every one of these lost before; the 1 MiB chunk changes the
+# baseline they lost against, so they are re-priced rather than assumed.
+io pread t18	OBRC_THREADS=18 ./target/release/io_floor pread measurements.txt
+io pread_fd t18	OBRC_THREADS=18 ./target/release/io_floor pread_fd measurements.txt
+io pread_nored t18	OBRC_THREADS=18 ./target/release/io_floor pread_nored measurements.txt
+io mmap_seq t18	OBRC_THREADS=18 ./target/release/io_floor mmap_seq measurements.txt
+io mmap_shared t18	OBRC_THREADS=18 ./target/release/io_floor mmap_shared measurements.txt
+io mmap_willneed t18	OBRC_THREADS=18 ./target/release/io_floor mmap_willneed measurements.txt

@@ -1,0 +1,30 @@
+# Stage 2: -C target-feature=+cssc. Same source, two builds.
+#
+# `target-cpu=native` resolves to apple-m4, which does not model FEAT_CSSC even though the
+# hardware has it. Enabling it turns 44 rbit+clz pairs into 46 single ctz, 9 of them in the
+# worker. `trailing_zeros()` runs three times per row on the chain from the load to the table
+# slot, so if instruction count on that chain matters at all, it should show here.
+#
+# Both builds carry the new 1 MiB chunk default.
+#
+# +cssc has since become the default, so re-running this inverts the snapshot: build the tree as
+# it stands to get the `cssc` arm, then drop the flag and build again for the `base` arm.
+#   cargo build --release
+#   mkdir -p target/cssc/release && cp target/release/v12_pairs target/release/hot_floor target/cssc/release/
+#   # remove "-C target-feature=+cssc" from .cargo/config.toml
+#   cargo build --release
+#   cp target/release/v12_pairs target/release/v12_base
+#   cp target/release/hot_floor target/release/hot_floor_base
+# Snapshot immediately before the change and from a clean tree, or the A/B is against the wrong
+# thing. Restore the flag afterwards.
+v12 base  t18	OBRC_THREADS=18 ./target/release/v12_base measurements.txt
+v12 cssc  t18	OBRC_THREADS=18 ./target/cssc/release/v12_pairs measurements.txt
+v12 base  t8	OBRC_THREADS=8 ./target/release/v12_base measurements.txt
+v12 cssc  t8	OBRC_THREADS=8 ./target/cssc/release/v12_pairs measurements.txt
+
+# The same comparison with the read taken out, so a null result at the top can be told apart
+# from "the read hid it".
+hf base  warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor_base keyed2
+hf cssc  warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/cssc/release/hot_floor keyed2
+hf base  warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor_base keyed2
+hf cssc  warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/cssc/release/hot_floor keyed2

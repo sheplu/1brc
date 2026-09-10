@@ -1,0 +1,16 @@
+# Stage 1 follow-up: 1 MiB beat the shipped 2 MiB by 11 ms in the coarse sweep, but 512K and
+# below are far worse, so the curve has an interior optimum. Find it, and check it at 8 threads
+# too -- the README quotes both.
+#
+# The surviving hypothesis is per-*cluster* L2, not per-core: an E-cluster is 8 MB shared by 6
+# cores, so 6 x 1 MiB of live buffer fits and 6 x 2 MiB does not. That predicts the knee sits
+# just under 8 MB / 6 = 1.33 MiB.
+chunk 768K t18	OBRC_THREADS=18 OBRC_CHUNK=786432 ./target/release/v12_pairs measurements.txt
+chunk 1M   t18	OBRC_THREADS=18 OBRC_CHUNK=1048576 ./target/release/v12_pairs measurements.txt
+chunk 1.25M t18	OBRC_THREADS=18 OBRC_CHUNK=1310720 ./target/release/v12_pairs measurements.txt
+chunk 1.5M t18	OBRC_THREADS=18 OBRC_CHUNK=1572864 ./target/release/v12_pairs measurements.txt
+chunk 2M   t18	OBRC_THREADS=18 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+
+chunk 1M   t8	OBRC_THREADS=8 OBRC_CHUNK=1048576 ./target/release/v12_pairs measurements.txt
+chunk 1.25M t8	OBRC_THREADS=8 OBRC_CHUNK=1310720 ./target/release/v12_pairs measurements.txt
+chunk 2M   t8	OBRC_THREADS=8 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt

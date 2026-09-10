@@ -1,2 +1,10 @@
+# `+cssc` is not redundant with `target-cpu=native`. LLVM resolves native to `apple-m4` here,
+# and neither apple-m4 nor apple-m5 models FEAT_CSSC even though the hardware reports it. It
+# is worth 15 ms of 465: `trailing_zeros()` runs three times per row on the chain from the
+# load to the table slot, and CSSC turns each `rbit` + `clz` into one `ctz`.
+#
+# Two costs. rustc calls the feature unstable, so every build warns. And unlike `native`,
+# which degrades, this one does not: on an M1 through M3 the binary will SIGILL. Delete the
+# second flag to build there.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+cssc"]

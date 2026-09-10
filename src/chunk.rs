@@ -4,9 +4,18 @@
 //! same expression as chunk `i+1`'s start, so workers never need to communicate to agree
 //! on where a line belongs.
 
-/// 2 MiB. Small enough that the fastest and slowest core tiers stay balanced via work
-/// stealing, large enough that the per-chunk bookkeeping is noise.
-pub const CHUNK_SIZE: usize = 2 << 20;
+/// 1 MiB, measured. The curve is nearly flat from 768 KiB to 1.5 MiB and worth ~9 ms of 436
+/// against the 2 MiB this used to be; below 512 KiB it climbs steeply, reaching 557 ms at
+/// 128 KiB, where 105k `pread`s of bookkeeping is the whole difference. The tilt at the top
+/// does not appear at 8 threads, which points at the shared L2 — an E-cluster is 8 MB across
+/// 6 cores, so six 1 MiB buffers fit between the read and the parse that reads them back, and
+/// six 2 MiB ones do not.
+///
+/// The sweep saying 1 MiB had been in the README for several versions while this constant was
+/// 2 MiB, because at the time it was taken the curve really was flat past 1 MiB and the value
+/// looked like it did not matter. It stopped being flat once the parse got fast enough for the
+/// difference to show. A swept constant is only swept for the program that swept it.
+pub const CHUNK_SIZE: usize = 1 << 20;
 
 /// Index of the first byte after the next `\n` at or after `from`, clamped to the end.
 #[inline]

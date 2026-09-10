@@ -1,0 +1,3 @@
+v1_naive	./target/release/v1_naive measurements.txt
+v12_pairs t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt
+v9_flatscan t18	OBRC_THREADS=18 ./target/release/v9_flatscan measurements.txt

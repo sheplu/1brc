@@ -1,44 +1,43 @@
-//! v11: the table's probe key is taken from the scan instead of re-read from memory.
+//! v12: two interleaved line streams instead of three.
 //!
-//! **The observation.** Disassembling v10's inner loop turns up ~135 instructions per row,
-//! against a measured ~17 cycles per row per thread — so at Apple's issue width the loop is
-//! *instruction-throughput* bound, not latency bound. Roughly half those instructions are not
-//! the algorithm. The largest single block is the probe key: `probe_key` loads the name's 32
-//! bytes as two `u128`s, indexes a mask table twice, and `and`s — four loads, two `adrp`/`add`
-//! address computations, two mask loads and four masks — and then, because a 32-byte key plus
-//! three interleaved row states will not fit in the register file, LLVM spills the key to the
-//! stack and reloads it four instructions later for the compare.
+//! **The observation.** Instrumenting v11's phases put 80% of the wall clock in the parse loop
+//! and only 17% in `pread` — and the parse runs at roughly 3.7 instructions per cycle on a core
+//! that issues 8 to 10. Less than half of issue width is a stall, not an instruction count, so
+//! the question was whether the loop is still latency bound. The cheapest way to ask is the
+//! stream count, because [`split_streams`] is already generic over it.
 //!
-//! **The change.** All of that recomputes bytes the scan is already holding.
-//! [`scan_flat_keyed`] loads the name's first 16 bytes and masks off everything at and past the
-//! `;` — it has to, or the trailing garbage would reach the hash. For any name that fits its
-//! window, that masked pair *is* the probe key: `probe_key` keeps the low `len` bytes of the
-//! same 16 and zeroes the rest, and its high `u128` is `MASK[0]`, which is zero. So the scan
-//! hands the two words back and
-//! [`upsert_words`](InlineTable::upsert_words) starts its compare with both operands already
-//! in registers. One select replaces four loads, two mask lookups, four `and`s and a spill
-//! pair.
+//! **The change.** `STREAMS` 3 → 2. That is the whole diff.
 //!
-//! Knowing the name is under 16 bytes then collapses the probe a second time. That length
-//! guarantees a zero byte inside the first 16, which no stored name of 16 bytes or more has
-//! and no empty slot lacks — so the key's *low* half alone separates the query from every
-//! entry the table can hold. The high half, the length check and the long-name comparison all
-//! drop out, and the probe reads one `ldp` off the entry's line instead of two.
+//! v7 picked 3 by measurement and 4 lost there, but that was when the 32-byte probe key spilled
+//! to the stack: every extra stream cost a spill slot on top of its registers. v11 deleted the
+//! spill and, in doing so, shortened the per-row dependency chain — the probe now begins with
+//! both key words already in registers instead of waiting on four loads and two mask lookups. A
+//! shorter chain needs less interleaving to cover, and once it is covered each further stream is
+//! nothing but register pressure.
 //!
-//! Names of 16 bytes and over do not fit the window, so their length is not known there and
-//! neither is their key. They take [`step_long`], which is v10's row verbatim; the branch is
-//! the same ~33:1 one v9 already relied on, and it predicts.
+//! The sweep says exactly that, and it is monotone past 2. Parsing a warm mapping at 18 threads,
+//! one interleaved batch: 1 stream 452 ms, **2 355**, 3 374, 4 385, 5 395, 6 400, 8 440. Going
+//! from 1 to 2 is worth 97 ms; every step after 2 costs about 10. Under `pread` in the same
+//! batch: 2 443, 3 472, 4 475, 5 478.
 //!
-//! Everything else is v10: `pread` into a recycled per-thread buffer, the fixed 16-byte `;`
-//! window, no final avalanche, three interleaved line streams, a table that grows on demand.
+//! So the loop was never latency bound at 3 — it was over-interleaved. One stream leaves the
+//! chain exposed, two cover it, and three pays for a third copy of the row state without having
+//! anything left to hide. That also settles the question the sweep was run to answer: the
+//! remaining ~313 ms of computation is throughput, not stalls, so the only thing left that moves
+//! it is fewer instructions per row.
 //!
-//! **What it bought.** The hot row goes from ~148 instructions to ~96 and no longer spills. One
-//! interleaved batch, 1e9 rows: 535 ms → **463 ms** at 18 threads (−13.5%), 946 → **784** at 8
-//! (−17.1%). In `hot_floor` under `pread`, `raw3` → `keyed3` is 511 → 440 ms — 71 ms, which is 26%
-//! of all compute above the 237 ms read floor and the largest single win in the project measured
-//! that way.
+//! **What it bought, and where it does not.** End to end, one interleaved batch: 467 → **448 ms**
+//! at 18 threads (−4.1%), and 809 → 808 at 8 — a wash. The 8-thread sweep explains why: there
+//! the order reverses, 1 stream 949 ms, 2 662, **3 643**, 4 660. The optimum is a property of the
+//! core, not of the program. At 8 threads the work sits on the widest cores, which have the
+//! reorder depth to keep a third stream in flight; at 18 it spreads across all three tiers and
+//! the narrower ones cannot. Two is chosen here because 18 threads is the headline configuration
+//! and 8 loses nothing by it.
 //!
-//! Usage: v11_keyed [path]   (OBRC_THREADS, default 8; OBRC_TABLE_BITS, default 14)
+//! Everything else is v11: `pread` into a recycled per-thread buffer, the fixed 16-byte `;`
+//! window, no final avalanche, the keyed probe, a table that grows on demand.
+//!
+//! Usage: v12_pairs [path]   (OBRC_THREADS, default 8; OBRC_TABLE_BITS, default 14)
 
 use std::collections::BTreeMap;
 use std::env;
@@ -59,8 +58,8 @@ use obrc::MAX_LINE_LEN;
 /// See v10: 2^13..2^16 all measure the same, and this is the smallest of them.
 const DEFAULT_TABLE_BITS: u32 = 14;
 
-/// Same as v7 — see the note there on why 4 and above lose.
-const STREAMS: usize = 3;
+/// The one number that changed from v11. See the module docs for the sweep.
+const STREAMS: usize = 2;
 
 /// Read past the chunk so the line straddling its end can be finished locally.
 const OVERLAP: usize = MAX_LINE_LEN;

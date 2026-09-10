@@ -1,0 +1,9 @@
+# v11 vs v12 end to end, plus a check that 2 is still the optimum at 8 threads
+v11 t18	OBRC_THREADS=18 ./target/release/v11_keyed measurements.txt >/dev/null
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v11 t8	OBRC_THREADS=8 ./target/release/v11_keyed measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+keyed2 warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2
+keyed3 warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed3
+keyed4 warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed4
+keyed1 warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed

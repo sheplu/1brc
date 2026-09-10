@@ -31,6 +31,7 @@ extern "C" {
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn mlock(addr: *const c_void, len: usize) -> c_int;
     fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) -> c_int;
 }
 
@@ -73,6 +74,25 @@ impl Mapping {
         if self.len != 0 {
             unsafe { madvise(self.ptr, self.len, advice) };
         }
+    }
+
+    /// Wires `self[off..off + len]`, which installs its page table entries in one call instead
+    /// of one minor fault per page as the bytes are first touched.
+    ///
+    /// Reading 13.8 GB through a mapping takes 842k faults at a 16 KB page, and those measure
+    /// far above what an uncontended minor fault should cost — the interesting question is
+    /// whether the kernel will do them in bulk under one lock acquisition instead. Failure is
+    /// returned rather than panicked on: wiring is capped by `vm.user_wire_limit`, and being
+    /// refused is a result.
+    pub fn wire(&self, off: usize, len: usize) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let addr = unsafe { (self.ptr as *const u8).add(off) } as *const c_void;
+        if unsafe { mlock(addr, len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub fn as_slice(&self) -> &[u8] {

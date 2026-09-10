@@ -1,0 +1,16 @@
+keyed2 warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2
+hdr2   warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor hdr2
+win2   warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor win2
+hot2   warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor hot2
+keyed2 pread t18	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor keyed2
+hdr2   pread t18	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor hdr2
+win2   pread t18	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor win2
+hot2   pread t18	OBRC_THREADS=18 OBRC_READER=pread ./target/release/hot_floor hot2
+keyed2 warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2
+hdr2   warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor hdr2
+win2   warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor win2
+hot2   warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor hot2
+keyed2 pread t8	OBRC_THREADS=8 OBRC_READER=pread ./target/release/hot_floor keyed2
+hdr2   pread t8	OBRC_THREADS=8 OBRC_READER=pread ./target/release/hot_floor hdr2
+win2   pread t8	OBRC_THREADS=8 OBRC_READER=pread ./target/release/hot_floor win2
+hot2   pread t8	OBRC_THREADS=8 OBRC_READER=pread ./target/release/hot_floor hot2

@@ -64,6 +64,40 @@ pub fn parse_temp_branchless(d: &[u8], p: usize) -> (i16, usize) {
     (value as i16, p + (dot_bit as usize >> 3) + 3)
 }
 
+/// [`parse_temp_branchless`] taking the 8 bytes it reads instead of a slice and an index.
+///
+/// Identical arithmetic; only the load differs. `d[p..p + 8].try_into().unwrap()` costs the
+/// caller two compares and two branches to a panic, because nothing in the types relates `p`
+/// to `d.len()`. An `&[u8; 8]` carries that proof in the type, so the window is fetched once
+/// — one compare in `first_chunk` — and the parse itself checks nothing.
+///
+/// Returns the value and how far past the window start the next line begins, which is what
+/// [`parse_temp_branchless`] adds to `p`.
+///
+/// The body is duplicated rather than shared: routing the slice form through this one would
+/// change the code every shipped version up to v12 compiles to, and the point of the
+/// experiment is to move exactly one thing. `win_agrees_with_the_slice_form` holds them equal.
+#[inline]
+pub fn parse_temp_branchless_win(w: &[u8; 8]) -> (i16, usize) {
+    let word = u64::from_le_bytes(*w);
+    let inv = !word;
+
+    let dot_bit = (inv & 0x1010_1000).trailing_zeros();
+    let signed = ((inv << 59) as i64) >> 63;
+
+    let masked = word & !((signed as u64) & 0xFF);
+    let v = masked << (28 - dot_bit);
+
+    let tens = (v >> 8) & 0x0F;
+    let ones = (v >> 16) & 0x0F;
+    let frac = (v >> 32) & 0x0F;
+    let abs = (tens * 100 + ones * 10 + frac) as i64;
+
+    let value = (abs ^ signed) - signed;
+
+    (value as i16, (dot_bit as usize >> 3) + 3)
+}
+
 /// [`parse_temp_branchless`] for a caller that already knows where the line ends.
 ///
 /// `len` is the byte count from `p` to the `\n`, which a delimiter bitmap yields for free.
@@ -146,6 +180,27 @@ mod tests {
                 let branchless = parse_temp_branchless(&d, 0);
                 assert_eq!(branchless.0, expected, "value of {s:?} with filler {filler:#04x}");
                 assert_eq!(branchless, scalar, "parsing {s:?} with filler {filler:#04x}");
+            }
+        }
+    }
+
+    /// [`parse_temp_branchless_win`] is a copy with a different load, kept separate so that
+    /// adding it cannot move the code v1..v12 already compile to. Copies drift, so the
+    /// equality is a test: every legal value, under every filler the window might see past
+    /// the line.
+    #[test]
+    fn win_agrees_with_the_slice_form() {
+        for (s, expected) in all_legal_values() {
+            for filler in [b'\n', b'x', b'0', b'9', b';', 0x00, 0xFF] {
+                let d = padded(&format!("{s}\n"), filler);
+                let w: &[u8; 8] = d[..8].try_into().unwrap();
+                let (value, advance) = parse_temp_branchless_win(w);
+                assert_eq!(value, expected, "value of {s:?} with filler {filler:#04x}");
+                assert_eq!(
+                    (value, advance),
+                    parse_temp_branchless(&d, 0),
+                    "parsing {s:?} with filler {filler:#04x}"
+                );
             }
         }
     }

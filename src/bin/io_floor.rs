@@ -10,9 +10,16 @@
 //!   mmap_shared  MAP_SHARED instead — no copy-on-write shadow object to set up
 //!   mmap_seq     MAP_PRIVATE + MADV_SEQUENTIAL
 //!   mmap_willneed  MAP_PRIVATE + MADV_WILLNEED
+//!   mmap_touch   as `mmap`, but faults every page up front, one read per page
+//!   mmap_mlock   as `mmap`, but faults every page up front by wiring it
 //!   pread        one shared `File`, `pread` per chunk into a recycled buffer
 //!   pread_fd     as `pread`, but each thread opens its own descriptor
 //!   pread_nored  as `pread`, without the XOR reduce — copy cost alone
+//!
+//! The two prefault modes split the mmap number in two. A traversal of already-resident pages
+//! runs at DRAM speed; `mmap` measures several times that, so nearly all of it is the 842k
+//! minor faults rather than the reading. Both report the prefault separately and then the same
+//! total as `mmap`, so the two are directly comparable and the split is visible.
 //!
 //! `pread` and `pread_fd` differ only in whether the workers share one file description.
 //! If the second scales where the first does not, the ceiling is contention on that shared
@@ -83,6 +90,35 @@ impl Chunks<'_> {
     }
 }
 
+/// Page size on this platform. Not queried: Darwin arm64 is 16 KB everywhere, and a wrong
+/// guess here would only change how many redundant touches the prefault does.
+const PAGE: usize = 16384;
+
+/// Installs the PTEs for every chunk, on `threads` threads, and returns the seconds it took.
+///
+/// `wire` uses `mlock`, which asks the kernel to do a whole range at once; the other path pays
+/// an ordinary minor fault per page, forced by a volatile read that cannot be elided. Both
+/// walk the same chunk cursor, so the two differ only in the mechanism.
+fn prefault(data: &[u8], chunks: &Chunks, threads: usize, mapping: &Mapping, wire: bool) -> f64 {
+    let start = Instant::now();
+    spawn_all(threads, || {
+        while let Some((a, b)) = chunks.next_range() {
+            if wire {
+                mapping.wire(a, b - a).expect("mlock");
+            } else {
+                let mut p = a;
+                while p < b {
+                    unsafe { core::ptr::read_volatile(data.as_ptr().add(p)) };
+                    p += PAGE;
+                }
+            }
+        }
+        0
+    });
+    chunks.cursor.store(0, Ordering::Relaxed);
+    start.elapsed().as_secs_f64()
+}
+
 fn main() {
     let mode = env::args().nth(1).unwrap_or_else(|| "mmap".to_string());
     let path = env::args().nth(2).unwrap_or_else(|| "measurements.txt".to_string());
@@ -101,7 +137,7 @@ fn main() {
 
     let mmap_flags = match mode.as_str() {
         "mmap_shared" => Some(MAP_SHARED),
-        "mmap" | "mmap_seq" | "mmap_willneed" => Some(MAP_PRIVATE),
+        "mmap" | "mmap_seq" | "mmap_willneed" | "mmap_touch" | "mmap_mlock" => Some(MAP_PRIVATE),
         _ => None,
     };
 
@@ -118,6 +154,14 @@ fn main() {
                 _ => {}
             }
             let data = mapping.as_slice();
+            match mode.as_str() {
+                "mmap_touch" | "mmap_mlock" => {
+                    let wire = mode == "mmap_mlock";
+                    let secs = prefault(data, &chunks, threads, &mapping, wire);
+                    eprintln!("  prefault {secs:.3} s");
+                }
+                _ => {}
+            }
             spawn_all(threads, || {
                 let mut local = 0u64;
                 while let Some((a, b)) = chunks.next_range() {
