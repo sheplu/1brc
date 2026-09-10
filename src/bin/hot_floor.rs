@@ -385,7 +385,7 @@ impl Row for RowTable<'_> {
 /// `bl` to `InlineTable::upsert`, later ones had it inlined. A mode was therefore faster or
 /// slower partly by where it sat in the `match` — exactly the artefact this harness exists to
 /// rule out. Being generic over `f`, this gets one instantiation per call site, so every mode
-/// starts with a full budget; the extra call costs one branch per 2 MiB chunk.
+/// starts with a full budget; the extra call costs one branch per chunk.
 ///
 /// The drivers themselves stay `#[inline(always)]`, because the row body has to fuse *into*
 /// the loop. Marking the drivers `#[inline(never)]` instead looks equivalent and is not: the

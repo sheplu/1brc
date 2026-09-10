@@ -1,0 +1,24 @@
+# Stage 3: sum and count as two adjacent 8-byte fields, paid for with the bottom half of the
+# stored hash. Baseline is the same source with `count: u32`; both builds carry the 1 MiB chunk
+# and +cssc.
+#
+# LLVM did not emit ldp/stp -- it vectorised, so the accumulate is one `ldr q` / `str q` pair
+# instead of two scalar loads and two scalar stores. Two memory ops become one of each; the
+# instruction count is unchanged, because three GPR->SIMD moves replace the two scalar adds.
+# That is the exact shape v13 lost on, so the clock decides.
+#
+# It lost: 402 -> 396 ms median, 396 -> 392 on the minimums, against an 8 ms gate. The layout was
+# reverted, so this file is a record rather than a runnable batch -- the `pair` arm no longer
+# exists in the tree. To re-run it, widen Entry.count to u64 and shrink hash to a u32 holding its
+# top half (Entry has to stay 64 bytes), snapshotting the clean build as v12_base first. See the
+# comment on Entry in src/inline_table.rs.
+v12 base t18	OBRC_THREADS=18 ./target/release/v12_base measurements.txt
+v12 pair t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt
+v12 base t8	OBRC_THREADS=8 ./target/release/v12_base measurements.txt
+v12 pair t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt
+
+# Read removed, so a null at the top can be told apart from the read hiding it.
+hf base warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor_base keyed2
+hf pair warm t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2
+hf base warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor_base keyed2
+hf pair warm t8	OBRC_THREADS=8 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2

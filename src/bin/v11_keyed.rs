@@ -92,7 +92,7 @@ fn step_long(buf: &[u8], table: &mut InlineTable, pos: usize) -> usize {
     next
 }
 
-/// What one worker spent its life on. Three `Instant::now()` per 2 MiB chunk is ~370 chunks a
+/// What one worker spent its life on. Three `Instant::now()` per chunk is ~730 chunks a
 /// thread and under 30 µs all told, so this is measured unconditionally and only *reported*
 /// under `OBRC_PHASES`. Reading and parsing are strictly serialized within a thread, so the two
 /// do add up — the interesting quantity is the ratio, and how far the slowest thread runs past

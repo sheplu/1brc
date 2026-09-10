@@ -31,16 +31,21 @@ pub const INLINE_KEY: usize = 32;
 /// Readable bytes the probe requires from the start of a name.
 pub const KEY_SLACK: usize = INLINE_KEY;
 
-/// One cache line. Two entries never share a line, so a probe touches exactly one.
+/// 64 bytes, 64-byte aligned — *not* a cache line. This machine's line is 128 bytes, so two
+/// entries always share one. That is harmless here and mildly useful: the table is per-thread,
+/// so there is no false sharing, and a linear probe's next slot arrives with the current one.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 pub struct Entry {
     /// The name's first [`INLINE_KEY`] bytes, zero beyond `len`. All-zero means the slot is
     /// empty — see [`upsert`](InlineTable::upsert) for why no real name can look like that.
     key: [u128; 2],
-    /// `sum`..`max` are the only fields a repeat row touches, so they are kept adjacent and
-    /// 16-byte aligned: the accumulate is then one load pair and one store pair, not four of
-    /// each scattered across the line.
+    /// `sum`..`max` are the only fields a repeat row touches, so they are kept adjacent. The
+    /// accumulate is still four loads and two stores: `sum` and `count` differ in width, so
+    /// nothing pairs. Widening `count` to `u64` to make them pair was tried — LLVM answered
+    /// with one `ldr q`/`str q` instead of an `ldp`/`stp`, halving the memory ops for the same
+    /// instruction count, and the clock moved 6 ms of 402. Not worth truncating the stored
+    /// hash to pay for it.
     sum: i64,
     count: u32,
     min: i16,
@@ -50,7 +55,7 @@ pub struct Entry {
     len: u32,
     /// Only [`grow`](InlineTable::grow) reads this, to re-slot the entry without having to
     /// re-hash a name it would first have to reassemble. The other 56 bytes leave exactly
-    /// this much padding in the cache line, so carrying it is free.
+    /// this much padding, so carrying it is free.
     hash: u64,
 }
 
@@ -384,9 +389,6 @@ impl InlineTable {
     }
 }
 
-/// Extends an entry's range. Out of line so the common row pays no store; see [`upsert`].
-///
-/// [`upsert`]: InlineTable::upsert
 /// [`upsert_words`](InlineTable::upsert_words) against slots borrowed out of the table with
 /// [`hot_slots`](InlineTable::hot_slots).
 ///
@@ -430,6 +432,8 @@ pub fn probe_words(slots: &mut [Entry], shift: u32, hash: u64, key_lo: u128, val
     }
 }
 
+/// Extends an entry's range. Out of line so the common row pays no store; see
+/// [`upsert`](InlineTable::upsert).
 #[cold]
 #[inline(never)]
 fn widen(e: &mut Entry, value: i16) {

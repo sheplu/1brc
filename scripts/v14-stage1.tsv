@@ -1,0 +1,33 @@
+# Stage 1: the three free knobs, one batch. Baseline is "chunk 2M t18" (the shipped default).
+#
+# Chunk sweep. 18 threads x 2 MiB = 36 MiB of live buffers against 16 + 8 + 8 MB of L2, so the
+# pread's bytes are evicted before the parse reads them back. The old sweep that found this
+# flat was run on v8, before the loop was fast enough for the re-fetch to show.
+chunk 128K t18	OBRC_THREADS=18 OBRC_CHUNK=131072 ./target/release/v12_pairs measurements.txt
+chunk 256K t18	OBRC_THREADS=18 OBRC_CHUNK=262144 ./target/release/v12_pairs measurements.txt
+chunk 512K t18	OBRC_THREADS=18 OBRC_CHUNK=524288 ./target/release/v12_pairs measurements.txt
+chunk 1M   t18	OBRC_THREADS=18 OBRC_CHUNK=1048576 ./target/release/v12_pairs measurements.txt
+chunk 2M   t18	OBRC_THREADS=18 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+chunk 4M   t18	OBRC_THREADS=18 OBRC_CHUNK=4194304 ./target/release/v12_pairs measurements.txt
+
+# Thread sweep at the shipped chunk. Never swept above 18.
+chunk 2M   t20	OBRC_THREADS=20 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+chunk 2M   t24	OBRC_THREADS=24 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+chunk 2M   t28	OBRC_THREADS=28 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+chunk 2M   t36	OBRC_THREADS=36 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+
+# The two knobs interact through total live footprint, so a few crosses.
+chunk 256K t24	OBRC_THREADS=24 OBRC_CHUNK=262144 ./target/release/v12_pairs measurements.txt
+chunk 512K t24	OBRC_THREADS=24 OBRC_CHUNK=524288 ./target/release/v12_pairs measurements.txt
+chunk 512K t28	OBRC_THREADS=28 OBRC_CHUNK=524288 ./target/release/v12_pairs measurements.txt
+
+# Control: at 8 threads the live footprint is 16 MiB, which already fits. If the chunk effect
+# is a cache-capacity effect it has to be much weaker here.
+chunk 2M   t8	OBRC_THREADS=8 OBRC_CHUNK=2097152 ./target/release/v12_pairs measurements.txt
+chunk 512K t8	OBRC_THREADS=8 OBRC_CHUNK=524288 ./target/release/v12_pairs measurements.txt
+
+# debug = 1 costs 125 KB of binary to page in. ~21 ms of the 441 is outside main. Commented out
+# because it needs a second build tree; to run it, set strip = true in Cargo.toml and
+#   CARGO_TARGET_DIR=target/strip cargo build --release
+# then uncomment. It did not pay -- see the README's "predicted to work and did not".
+#strip      t18	OBRC_THREADS=18 OBRC_CHUNK=2097152 ./target/strip/release/v12_pairs measurements.txt
