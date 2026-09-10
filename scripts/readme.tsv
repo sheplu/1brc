@@ -10,12 +10,16 @@ v8_pread t8	OBRC_THREADS=8 ./target/release/v8_pread measurements.txt
 v9_flatscan t8	OBRC_THREADS=8 ./target/release/v9_flatscan measurements.txt
 v10_rawhash t8	OBRC_THREADS=8 ./target/release/v10_rawhash measurements.txt
 v11_keyed t8	OBRC_THREADS=8 ./target/release/v11_keyed measurements.txt
+v12_pairs t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt
+v13_hoist t8	OBRC_THREADS=8 ./target/release/v13_hoist measurements.txt
 # The headline, 18 threads.
 v7_pipelined t18	OBRC_THREADS=18 ./target/release/v7_pipelined measurements.txt
 v8_pread t18	OBRC_THREADS=18 ./target/release/v8_pread measurements.txt
 v9_flatscan t18	OBRC_THREADS=18 ./target/release/v9_flatscan measurements.txt
 v10_rawhash t18	OBRC_THREADS=18 ./target/release/v10_rawhash measurements.txt
 v11_keyed t18	OBRC_THREADS=18 ./target/release/v11_keyed measurements.txt
+v12_pairs t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt
+v13_hoist t18	OBRC_THREADS=18 ./target/release/v13_hoist measurements.txt
 # I/O floor, both readers, both thread counts.
 io mmap t8	OBRC_THREADS=8 ./target/release/io_floor mmap measurements.txt
 io pread t8	OBRC_THREADS=8 ./target/release/io_floor pread measurements.txt
@@ -43,3 +47,13 @@ hf pread itable3 t18	OBRC_THREADS=18 ./target/release/hot_floor itable3 measurem
 hf pread flat3 t18	OBRC_THREADS=18 ./target/release/hot_floor flat3 measurements.txt
 hf pread raw3 t18	OBRC_THREADS=18 ./target/release/hot_floor raw3 measurements.txt
 hf pread keyed3 t18	OBRC_THREADS=18 ./target/release/hot_floor keyed3 measurements.txt
+hf pread keyed2 t18	OBRC_THREADS=18 ./target/release/hot_floor keyed2 measurements.txt
+# The same engine with the read removed, which is what prices the reader honestly: the
+# difference between these and the pread rows above is what a free reader would be worth.
+hf warm touch t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor touch measurements.txt
+hf warm keyed3 t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed3 measurements.txt
+hf warm keyed2 t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor keyed2 measurements.txt
+# v13's two ablations: header hoist, fixed-size windows, both. All three lose.
+hf warm hdr2 t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor hdr2 measurements.txt
+hf warm win2 t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor win2 measurements.txt
+hf warm hot2 t18	OBRC_THREADS=18 OBRC_READER=mmap_warm ./target/release/hot_floor hot2 measurements.txt

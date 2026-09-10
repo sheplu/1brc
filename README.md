@@ -5,7 +5,7 @@ sorted. [The original challenge](https://github.com/gunnarmorling/1brc) is Java;
 port used as an optimization exercise, so every stage of the work is kept as its own binary and
 benchmarked against the ones before it.
 
-**80.9 s → 0.46 s.** No external crates: the syscalls are hand-written `extern "C"`, the threading
+**80.9 s → 0.44 s.** No external crates: the syscalls are hand-written `extern "C"`, the threading
 is `std::thread`, and the only vector code is SWAR in plain `u64`.
 
 ## Results
@@ -18,27 +18,36 @@ oracle's on the full dataset.
 | | technique | 8 threads | 18 threads |
 |---|---|---:|---:|
 | `v1_naive` | `BufReader` + `split(';')` + `f64` + `BTreeMap`, single-threaded | 80.9 s | — |
-| `v2_mmap` | mmap, work-stealing chunks, hand-rolled Fx hasher | 2.181 s | |
-| `v3_hash` | open-addressing table, 32-byte entries, keys as offsets | 2.047 s | |
-| `v4_simd` | SWAR `;` scan with the hash fused into it | 1.983 s | |
-| `v5_branchless` | branchless temperature parse, word-wise key compare | 1.710 s | |
-| `v6_inline` | station name stored *inside* the table entry | 1.504 s | |
-| `v7_pipelined` | 3 independent line streams per chunk | 1.470 s | 866 ms |
-| `v8_pread` | `pread` into a per-thread buffer instead of mmap | 1.271 s | 677 ms |
-| `v9_flatscan` | fixed-width branchless `;` scan | 984 ms | 556 ms |
-| `v10_rawhash` | hash indexed off high bits, no avalanche | 946 ms | 535 ms |
-| **`v11_keyed`** | **the probe key falls out of the scan** | **784 ms** | **463 ms** |
+| `v2_mmap` | mmap, work-stealing chunks, hand-rolled Fx hasher | 2.232 s | |
+| `v3_hash` | open-addressing table, 32-byte entries, keys as offsets | 2.092 s | |
+| `v4_simd` | SWAR `;` scan with the hash fused into it | 1.992 s | |
+| `v5_branchless` | branchless temperature parse, word-wise key compare | 1.709 s | |
+| `v6_inline` | station name stored *inside* the table entry | 1.507 s | |
+| `v7_pipelined` | 3 independent line streams per chunk | 1.499 s | 878 ms |
+| `v8_pread` | `pread` into a per-thread buffer instead of mmap | 1.298 s | 687 ms |
+| `v9_flatscan` | fixed-width branchless `;` scan | 1.002 s | 585 ms |
+| `v10_rawhash` | hash indexed off high bits, no avalanche | 970 ms | 563 ms |
+| `v11_keyed` | the probe key falls out of the scan | 815 ms | 471 ms |
+| **`v12_pairs`** | **2 interleaved line streams instead of 3** | **808 ms** | **441 ms** |
+| ~~`v13_hoist`~~ | ~~table header hoisted, bounds checks removed~~ | 839 ms | 455 ms |
 
-8 threads is the ladder's comparison baseline. 18 — every core — is the headline: **463 ms**.
+8 threads is the ladder's comparison baseline. 18 — every core — is the headline: **441 ms**.
 (`v1_naive` is the one number measured in its own batch, paired against v9, since a 140× ratio does
 not need three digits; v9 came out at 591 ms there.)
 
-The last two rows are not the same kind of result. v10 removes five serial operations from the hot
-loop and the *engine* gets 3–4% faster for it in every batch it has been measured in; the
-whole-binary gap has come out anywhere from 0.3% to 6% depending on the batch, so the 3.9% here is
+v13 is in the table because it is struck through. It removes 20 instructions per row and is 3%
+slower for it, in three separate batches; it is kept in the tree as a counterexample and nothing
+ships it. See below.
+
+The last three rows are not the same kind of result. v10 removes five serial operations from the
+hot loop and the *engine* gets 3–4% faster for it in every batch it has been measured in; the
+whole-binary gap has come out anywhere from 0.3% to 6% depending on the batch, so the 3.8% here is
 consistent with the engine number and is not on its own evidence of anything. v11 removes about a
-third of the hot loop's *instructions*, and that one shows up everywhere: −13.5% at 18 threads,
-−17.1% at 8, and −26% of the compute above the read floor. Both facts are in the tables below.
+third of the hot loop's *instructions*, and that one shows up everywhere: −16.3% at 18 threads,
+−16.0% at 8, and −25% of the compute above the read. v12 changes one constant — three
+interleaved streams down to two — and is worth 6.4% at 18 threads and nothing at all at 8, because
+the optimum is a property of the core and reverses between them. All three facts are in the tables
+below.
 
 Thread sweep, v8 against v9 in one batch of their own:
 
@@ -48,24 +57,38 @@ Thread sweep, v8 against v9 in one batch of their own:
 | `v9_flatscan` | 1.362 s | 1.097 s | 803 ms | 708 ms | 641 ms | 608 ms |
 | | −17.5% | −15.5% | −11.7% | −11.4% | −10.0% | −9.7% |
 
-The win shrinks as threads are added because ~220 ms of the total is I/O that v9 does not touch,
-and that fixed cost is a growing share of a shrinking number. Against compute alone the gain is
-roughly 18% at 8 threads and 14% at 18.
+The win shrinks as threads are added because some fixed fraction of the total is I/O that v9 does
+not touch, and that cost is a growing share of a shrinking number. *How much* was got wrong for
+several versions; see the next section.
 
 Both curves are monotone here. An earlier batch had v8 flat across 14 and 16 threads with σ up to
 89 ms at 16, and that did not reproduce — worth recording as a caution about reading structure into
 a single sweep. Note too that this batch puts v9 at 608 ms, a v9-only sweep said 579, and the
-ladder above says 556. That ±5% is the batch effect this README keeps insisting on, and it is
+ladder above says 585. That ±5% is the batch effect this README keeps insisting on, and it is
 larger than several of the individual steps in the ladder.
 
 v11 was checked the same way, in a batch of its own: v10 → v11 is −12.1% at 6 threads, −13.2% at 8
 and −9.6% at 18 — the same shape as v9 and for the same reason, since the win is on compute and
-compute is a shrinking share of the total as threads are added against a fixed ~230 ms of I/O. The
-ladder batch puts the same two numbers at −17.1% and −13.5%. Four points of disagreement between
-two clean batches, on a win that is real in both, is the size of the effect this README keeps
-warning about.
+compute is a shrinking share of the total as threads are added. The ladder batch puts the same two
+numbers at −16.0% and −16.3%. Several points of disagreement between two clean batches, on a win
+that is real in both, is the size of the effect this README keeps warning about.
 
 ## Where the time actually goes
+
+Where v12 spends 441 ms at 18 threads, from its own `OBRC_PHASES` instrumentation (median of three
+runs; the workers' figures are per-thread means, and reading and parsing are strictly serialized
+within a thread so the two add):
+
+| phase | ms | |
+|---|---:|---|
+| outside `main` | 21 | exec, dyld, teardown, and the harness's own spawn |
+| workers — read | 78 | 19% of worker time |
+| workers — **parse** | **340** | **81%** |
+| merge + output | 0.5 | 413 stations, 18 tables |
+| straggler | 1.1 | spread between the first and last thread to finish |
+
+Four fifths of the run is the parse loop, and the sections below are mostly about failing to make
+it smaller.
 
 Two ablation harnesses drove almost every decision here. Guessing was wrong more often than not —
 including about which *half* of a technique would be expensive; see the NEON bitmap below.
@@ -79,20 +102,20 @@ Under mmap with the offset-keyed table — the configuration that decided v6 (8 
 
 | stage | time | marginal | |
 |---|---:|---:|---|
-| `touch` | 453 ms | — | read every byte, XOR-reduce, nothing else |
-| `parse` | 1.391 s | +938 ms | SWAR `;` scan + branchless temperature parse |
-| `hash` | 1.423 s | +32 ms | fuse the name hash into the scan |
-| `nocmp` | 1.453 s | +30 ms | probe and update a table slot |
-| `table` | 1.677 s | +224 ms | **compare the key** |
+| `touch` | 442 ms | — | read every byte, XOR-reduce, nothing else |
+| `parse` | 1.379 s | +937 ms | SWAR `;` scan + branchless temperature parse |
+| `hash` | 1.420 s | +41 ms | fuse the name hash into the scan |
+| `nocmp` | 1.452 s | +32 ms | probe and update a table slot |
+| `table` | 1.694 s | +242 ms | **compare the key** |
 
 The last two rows are the whole story of v6. Probing the hash table is nearly free; *verifying* the
 key cost more than hashing and probing combined. Not because of the bytes compared — because with
 keys stored as offsets, checking one means dereferencing into a random spot in a 13.8 GB mapping, a
 second scattered memory access on every row. Moving the name onto the entry's own 64-byte cache
-line, which the probe has already loaded, deleted that access and most of that 224 ms with it.
+line, which the probe has already loaded, deleted that access and most of that 242 ms with it.
 
 The same harness measures instruction-level parallelism headroom by walking N independent line
-streams: `parse` 1.391 s → `parse2` 994 ms → `parse4` 915 ms. Rows form a serial dependency chain
+streams: `parse` 1.379 s → `parse2` 996 ms → `parse4` 919 ms. Rows form a serial dependency chain
 — a row's start address is only known once the previous row's temperature has been parsed — so a
 single stream leaves most of the out-of-order window idle.
 
@@ -108,38 +131,39 @@ Under `pread` with the inline-key table — what v8 onward actually ship (18 thr
 
 | stage | time | marginal | |
 |---|---:|---:|---|
-| `touch` | 237 ms | — | the I/O floor |
-| `parse` | 551 ms | +314 ms | scan + parse |
-| `hash` | 566 ms | +15 ms | + the fused hash |
-| `itable` | 639 ms | +73 ms | + the inline-key upsert; this is v8's engine |
-| `fhash` | 492 ms | −74 ms *vs* `hash` | the scan's loop replaced by a fixed window |
-| `flat` | 582 ms | −57 ms *vs* `itable` | the same swap, with the table; this is v9's |
-| `raw` | 557 ms | −25 ms *vs* `flat` | the hash's final avalanche deleted; v10's |
-| `keyed` | 520 ms | −37 ms *vs* `raw` | the probe key taken from the scan; v11's |
+| `touch` | 232 ms | — | read every byte and XOR-reduce it; **not the read floor, see below** |
+| `parse` | 554 ms | +322 ms | scan + parse |
+| `hash` | 563 ms | +9 ms | + the fused hash |
+| `itable` | 641 ms | +78 ms | + the inline-key upsert; this is v8's engine |
+| `fhash` | 492 ms | −71 ms *vs* `hash` | the scan's loop replaced by a fixed window |
+| `flat` | 589 ms | −52 ms *vs* `itable` | the same swap, with the table; this is v9's |
+| `raw` | 564 ms | −25 ms *vs* `flat` | the hash's final avalanche deleted; v10's |
+| `keyed` | 523 ms | −41 ms *vs* `raw` | the probe key taken from the scan; v11's |
 
 That second half was measured last and should have been measured first. For five versions the
 harness ran only against mmap and only against the offset-keyed table, so **every marginal cost in
 the first table describes v5's engine**, not the shipping one. Fixing the instrument was what
 exposed v9, and then v11.
 
-With three interleaved streams, which is what the binaries do, the same four rows are `itable3`
-621 ms → `flat3` 533 ms → `raw3` 511 ms → `keyed3` 440 ms. That last step is the largest single
-win in the project measured against compute: 71 ms is 26% of the 274 ms sitting above the read
-floor.
+With interleaved streams, which is what the binaries do, the same four rows are `itable3` 637 ms →
+`flat3` 543 ms → `raw3` 511 ms → `keyed3` 442 ms → `keyed2` 419 ms. The `raw3` → `keyed3` step is
+the largest single win in the project measured against compute.
+
+### The read floor was an artifact
 
 `io_floor <mode>` A/Bs just getting at the bytes, no parsing:
 
 | | 8 threads | 18 threads |
 |---|---:|---:|
-| mmap | 450 ms | 329 ms |
-| pread | 227 ms | 230 ms |
+| mmap | 442 ms | 329 ms |
+| pread | 224 ms | 225 ms |
 
 mmap takes a minor fault per 16 KB page — 842k of them — and all workers take them against the same
 `vm_map`. `pread` copies 13.8 GB instead and is still half the cost. It stops scaling past 8 threads
 while mmap keeps improving, so the floor predicted only ~90 ms of upside at 18; v8 gained more than
 that, because the faults were also stealing from compute rather than merely adding to it.
 
-Four attempts to push that floor lower, none of them a win, at 18 threads:
+Attempts to push that floor lower, none of them a win, at 18 threads:
 
 | | time | |
 |---|---:|---|
@@ -154,6 +178,33 @@ Four attempts to push that floor lower, none of them a win, at 18 threads:
 the machine is saturated, which looks exactly like contention on the shared file object. It is not
 — per-thread descriptors change nothing, so the ceiling is in the copy path itself. And the
 `madvise` calls, the obvious free win, range from neutral to actively harmful.
+
+**All of which pointed at a 230 ms floor that is not there.** Earlier drafts of this README quoted
+that number as a fixed I/O cost sitting under every version, and used it to explain why each
+compute win shrank as threads were added. It is an artifact of *how* it was measured: `touch` and
+`io_floor` do nothing but read, so eighteen threads arrive at the kernel's copy path simultaneously
+and queue behind each other. That is not the situation the real program is in.
+
+`OBRC_READER=mmap_warm` prefaults the mapping before the timer starts, so the same mode runs with
+the bytes already resident. The difference between a mode and its warm twin is what the read
+actually costs *that* mode — and it depends entirely on whether the threads have anything else to
+do. Same batch, 18 threads:
+
+| mode | `pread` | warm | the read costs |
+|---|---:|---:|---:|
+| `touch` | 232 ms | 58 ms | 174 ms |
+| `keyed3` | 442 ms | 362 ms | 80 ms |
+| `keyed2` | 419 ms | 348 ms | **71 ms** |
+
+v12's own `OBRC_PHASES` says 78 ms independently, from a completely different instrument. So a
+*free* reader would be worth about 75 ms of 441, not 230 — the rest overlaps with compute, because
+a thread that is parsing is not queueing. Every copy-free design that was going to reclaim
+"230 ms" — `mlock`, dedicated toucher threads, a producer-consumer split — was competing against a
+phantom, and all of them are now retired on that basis rather than on their own measurements.
+
+The general lesson is the one the harness keeps teaching in different costumes: **a stage measured
+in isolation is not the same stage measured in place.** An ablation that removes everything else
+does not price a component, it prices a component under contention it would never otherwise meet.
 
 Swapping the reader is not free architecturally: `pread` recycles one buffer per chunk, so a key
 stored as an offset into it would dangle as soon as the next chunk was read. The table had to be
@@ -194,7 +245,7 @@ made to own its keys first.
   folds the hash with two multiplies: more instructions, fewer cycles, and bit-identical output to
   the loop it replaces. Names ≥16 bytes (2.9%) take a `#[cold]` re-scan through the old loop, and
   *that* branch is biased ~33:1, so it predicts. Worth 121 ms at 18 threads and 287 ms at 8 —
-  roughly a quarter of the compute above the read floor, from a single branch.
+  roughly a quarter of the compute above the read, from a single branch.
 
   It stayed hidden for five versions because every ablation mode contained it. `parse`, `hash`,
   `table` and `itable` all scanned the same way, so it cancelled out of every difference the
@@ -234,12 +285,35 @@ made to own its keys first.
   so neither their length nor their key is known there; they take a `#[cold]` copy of v10's row,
   behind the same ~33:1 branch v9 already relied on.
 
-  ~148 instructions down to ~96, and no spill in the hot path. Engine `raw3` → `keyed3` is −71 ms,
-  which is 26% of all compute above the read floor; end to end −13.5% at 18 threads and −17.1% at 8.
+  ~148 instructions down to ~96, and no spill in the hot path. Engine `raw3` → `keyed3` is −69 ms,
+  which is a quarter of all compute above the read; end to end −16.3% at 18 threads and −16.0% at 8.
+- **v12** — one constant. v7 chose 3 interleaved streams and every version since inherited it
+  without rechecking, on measurements taken when the loop was a different shape. v11's is smaller
+  and holds more live state per stream, so it was worth sweeping again. Warm reader at 18 threads:
+  452 ms at N=1, **355 at N=2**, then 374, 385, 395, 400 and 440 at N=3, 4, 5, 6 and 8.
 
-## Three things that were predicted to work and did not
+  Monotone worsening past 2 is the informative part. If the loop were stalling on the row-to-row
+  dependency, more streams would keep helping; they do not, so the remaining compute is throughput
+  and the streams are now competing for registers rather than covering latency. Worth −6.4% at 18
+  threads. At 8 it is a wash — and the sweep *reverses* there, N=3 winning 643 ms against N=2's
+  662 — so the optimum is a property of which cores the scheduler hands out, not of the program.
+  The binary ships 2 because 18 threads is the headline.
+- **v13** — does not ship. The v12 disassembly showed the hot loop reloading four words of the
+  table header from the stack on every row, because `&mut InlineTable` stays live across a call
+  that might `grow` and replace `entries`, plus about eleven bounds-check instructions from slice
+  indexing the compiler cannot prove in range. Both are removable in safe Rust: handing out
+  `(&mut [Entry], u32)` lets the borrow checker prove `entries` cannot move, and deriving the mask
+  from `slots.len() - 1` makes `x & (len-1) < len` provable — which is exactly how
+  `InlineTable::grow` already compiled while `upsert_words` did not. Fixed-size `&[u8; 16]` and
+  `&[u8; 8]` windows move the length into the type so the scan and the parser check nothing.
 
-Recorded because the plans for v10 and v11 said they would, in writing, before the measurement.
+  It all worked. Per row: 116 instructions down to 96, four `ldr [sp, …]` down to zero, no compare
+  on the slot index and none on the probe's back-edge. And it is slower — 441 → 455 ms at 18
+  threads, 808 → 839 at 8, reproduced in three separate batches. See below.
+
+## Five things that were predicted to work and did not
+
+Recorded because the plans said they would, in writing, before the measurement.
 
 **The table would fit the dTLB.** 2^16 slots is 4 MiB per thread holding 413 live entries, scattered
 across ~205 distinct 16 KB pages — far more than the L1 dTLB maps. Shrinking to 2^11 (128 KB, 8
@@ -269,7 +343,7 @@ touched, so rows stop forming a dependency chain. `src/block.rs` does it for 64-
 
 | | time | |
 |---|---:|---|
-| `touch` | 235 ms | the read floor |
+| `touch` | 235 ms | reading alone, which overstates the read — see above |
 | `mask_semi` | 241 ms | the `;` bitmap, XORed into the sink and discarded |
 | `mask` | 247 ms | both bitmaps |
 | `dlrows` | 381 ms | + drain the bits to `(name, semi, nl)` triples |
@@ -294,6 +368,43 @@ At 6 threads, where the scheduler has the fast cores to hand out, `dltable` is 1
 `keyed3`'s 996 ms — a 22% loss. The gap is *widest* where per-core throughput is highest, which is
 the opposite of the predicted shape. The module stays in the tree as an instrument; nothing ships
 it.
+
+**Reclaiming the read.** A whole plan was written against the 230 ms read floor: `mlock` the
+mapping, or dedicate threads to touching pages ahead of the parsers, or split producer from
+consumer outright. Every design in it was arithmetic on a number that turned out to be an artifact
+of idle threads queueing on the kernel copy. Measured in place the read costs 71–80 ms, three
+different instruments agree, and the plan was deleted unimplemented. That is the cheapest failure
+in the project and the only reason it was cheap is that the premise got measured before the code
+got written. The section above has the numbers.
+
+**Fewer instructions per row.** v13, above. Three results now say the parse loop is not bound by
+anything the source can address: v12's stream sweep says it is not latency (more overlap made it
+monotonically worse), the NEON bitmap says it is not byte scanning (both delimiter masks cost 12 ms
+over `touch` and the design still lost), and v13 says it is not instruction count either — 20 fewer
+per row, 3% slower.
+
+v13's mechanism is worth stating because it generalises. The eleven bounds checks it deleted
+branched to *panic* blocks: never taken, macro-fused, and with nothing live at the target, so the
+register allocator could ignore them entirely. What replaced them — `get(pos..)?`, `first_chunk()?`,
+and a probe that returns `false` instead of inserting — are real loop exits, and every
+loop-carried value has to be materialized at each one. v13's preamble spills registers v12 never
+needed to. **An instruction count is not a cost model**: it does not price live ranges, and on a
+core this wide a never-taken fused compare-and-branch is nearly free while a constraint on the
+allocator is not.
+
+Ablations, warm reader at 18 threads, from a batch of their own where the spreads were tight
+(`keyed2` 333–351, `hot2` 349–357):
+
+| | time | |
+|---|---:|---|
+| `keyed2` | 341 ms | v12's engine |
+| `win2` | 346 ms | + fixed-size windows |
+| `hdr2` | 351 ms | + the header hoist |
+| `hot2` | 356 ms | both; the costs add |
+
+Same ordering at 8 threads and under `pread`. `src/bin/v13_hoist.rs` stays in the tree with the
+measurement in its module doc, and `scripts/edge.sh` runs it against the oracle like any other
+version — it is correct, just slower.
 
 ## Correctness
 
@@ -327,9 +438,9 @@ Testing, in rough order of how much it caught:
 
 - `scripts/edge.sh` — 13 hand-built inputs (single row, no trailing newline, exact page multiples
   including one ending in a 100-byte name, multi-byte UTF-8, names straddling the 16- and 32-byte
-  inline-key seams, 40-byte shared prefixes, every rounding extreme) run through all ten fast
+  inline-key seams, 40-byte shared prefixes, every rounding extreme) run through all twelve fast
   versions against the oracle.
-- `cargo test` — 56 tests. The parser is proved by exhaustion: all 1999 legal temperature strings
+- `cargo test` — 58 tests, in both debug and release. The parser is proved by exhaustion: all 1999 legal temperature strings
   against a reference parse, each with seven different trailing fillers in the 8-byte load. The
   chunk splitter is checked at every chunk size against a full-coverage invariant, and v8's
   local-only boundary rule is asserted equal to the global one for every chunk at every size.
@@ -356,13 +467,13 @@ on the real dataset — with 2.4M samples per station, landing exactly on a tie 
 ```sh
 cargo build --release
 ./target/release/generate 1000000000 measurements.txt   # ~14 GB, deterministic
-./target/release/v11_keyed measurements.txt
+./target/release/v12_pairs measurements.txt
 
-OBRC_THREADS=18 ./target/release/v11_keyed measurements.txt
+OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt
 
 cargo test
 scripts/edge.sh                                          # hand-built edge cases
-scripts/verify.sh v11_keyed                              # differential vs the oracle
+scripts/verify.sh v12_pairs                              # differential vs the oracle
 scripts/batch.sh scripts/readme.tsv                      # the ladder and both ablation tables
 scripts/batch.sh scripts/neon.tsv                        # the rejected NEON bitmap
 ```
@@ -370,9 +481,10 @@ scripts/batch.sh scripts/neon.tsv                        # the rejected NEON bit
 `scripts/batch.sh` is the only sanctioned way to compare two numbers here: it refuses to start on
 battery, primes the page cache, discards a warmup pass, and runs the configurations round-robin so
 drift lands on all of them equally rather than on whichever went last. `scripts/readme.tsv` is the
-45-configuration batch behind the ladder and both ablation tables; the thread sweeps, the `io_floor`
-variants and the NEON table each came from a smaller batch of their own, which is why they do not
-agree to the millisecond with the big one.
+49-configuration batch behind the ladder, both ablation tables and the read-cost correction; the
+thread sweeps, the `io_floor` variants, the stream sweep, the NEON table and the v13 ablations each
+came from a smaller batch of their own, which is why they do not agree to the millisecond with the
+big one.
 
 The generator is deterministic and parallel: 1,000 chunks of 1M rows, chunk `i` seeded
 `splitmix64(seed ^ i)`, so the file is byte-identical regardless of thread scheduling. It clamps to
@@ -392,13 +504,13 @@ L2 turned out not to matter, which was not the guess.
 - Numbers are from one laptop and move with power state and thermals. An early batch of results had
   to be thrown out after the machine was unplugged mid-session — a systematic ~13% shift that looks
   exactly like a real regression. Comparisons are only meaningful within a single interleaved batch,
-  and even a *plugged-in* one drifts: v9 measures 556 ms in the 45-configuration batch behind the
+  and even a *plugged-in* one drifts: v9 measures 585 ms in the 49-configuration batch behind the
   tables above, 590 ms in a 6-configuration batch, and 622 ms in another. Any win smaller than about
   5% needs its own batch to be believed, and a *trend* assembled from several such wins needs more
   than that — see the predictions above that did not survive a rep count.
 - For scale: the official Java winner is 1.535 s on 8 Zen2 cores, and the fastest known solution in
   any language is [austindonisan's C](https://github.com/austindonisan/1brc) at 0.577 s on that same
-  8-core machine. This does 784 ms on 8 cores of an M5 Pro — different silicon, so not a ranking,
+  8-core machine. This does 808 ms on 8 cores of an M5 Pro — different silicon, so not a ranking,
   but it does mean roughly 1.4× per core still separates this from the state of the art, down from
   2× before v11. The obvious explanation was his one big technique — parsing many rows at once off
   SIMD delimiter masks rather than one at a time — and that turns out not to be it: ported to NEON
