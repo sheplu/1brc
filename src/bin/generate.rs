@@ -7,7 +7,39 @@
 //!     clamp, and sigma=10 over 1e9 samples has a small but nonzero chance of emitting a
 //!     three-integer-digit value, which would silently corrupt a branchless parser.
 //!
-//! Usage: generate <rows> <output-path> [seed]
+//! `OBRC_GEN_STATIONS=n` keeps a stride-sampled n of the 413 names. It exists for one
+//! experiment, and the experiment is worth recording here because it closed a line of attack.
+//!
+//! **Does the table's live set bound the loop?** 413 entries scattered over 16384 slots land on
+//! ~408 distinct 128-byte lines, so the table holds ~52 KB of L1d resident while a 1 MiB chunk
+//! streams past it, against 64 KB of L1d on twelve of this machine's eighteen cores. No sweep in
+//! the project could see this: moving `OBRC_TABLE_BITS` from 2^13 to 2^16 changes the slot count
+//! and leaves exactly 413 entries live. Only the data moves the live set.
+//!
+//! 400M rows at each of 50, 100, 200 and 413 stations (`scripts/v15-footprint.tsv`, endpoints
+//! entered twice, REPS=9):
+//!
+//! ```text
+//!            t18    (dup)      t8    (dup)     bytes    names >= 16B
+//!   s50    0.164    0.164   0.280   0.279    5.405 GB      2.0%
+//!   s100   0.158            0.270            5.498 GB      2.0%
+//!   s200   0.160            0.274            5.439 GB      2.0%
+//!   s413   0.164    0.164   0.282   0.280    5.518 GB      2.4%
+//! ```
+//!
+//! Fifty stations is ~6 KB of entries, trivially resident, an eightfold cut in footprint. It is
+//! not faster than 413 — it ties, at both thread counts, against a noise floor the duplicate
+//! arms put at 0-2 ms. So the live set is not the bound, and the experiment was biased *toward*
+//! finding an effect: fewer stations also means shorter probe chains and a more predictable
+//! `step_long` branch, and even with those thrown in it came back flat.
+//!
+//! Two details worth keeping. The 4-6 ms by which 100 and 200 beat both endpoints is above the
+//! noise floor but non-monotonic, so there is no lever in it; it is not name length (the >= 16B
+//! fraction is flat, and s100 is the *larger* file) and it is not read (likewise). And netting
+//! out the ~20 ms loader, these files run 0.360 ns/row against the real dataset's 0.361 — the
+//! probe is a faithful miniature, which is what makes the flatness worth believing.
+//!
+//! Usage: generate <rows> <output-path> [seed]   (OBRC_GEN_STATIONS, default 413)
 
 use std::collections::BTreeMap;
 use std::env;
@@ -143,8 +175,20 @@ fn main() {
     let seed: u64 =
         args.get(3).map(|s| s.parse().expect("seed must be an integer")).unwrap_or(DEFAULT_SEED);
 
+    // `OBRC_GEN_STATIONS=n` keeps only n of the 413, which is the only way to vary how many
+    // table entries a run keeps live — the table-bits sweep moves the slot count but every
+    // slot count holds the same 413. Stride, not prefix: the list is alphabetical, and its
+    // first n would skew the name lengths the parser sees.
+    let keep = env::var("OBRC_GEN_STATIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (1..=STATIONS.len()).contains(n))
+        .unwrap_or(STATIONS.len());
+    let picked: Vec<(&str, f64)> =
+        (0..keep).map(|i| STATIONS[i * STATIONS.len() / keep]).collect();
+
     // "name;" precomputed so the hot loop does one copy instead of two.
-    let prefixes: Vec<Box<[u8]>> = STATIONS
+    let prefixes: Vec<Box<[u8]>> = picked
         .iter()
         .map(|(n, _)| {
             let mut v = n.as_bytes().to_vec();
@@ -152,7 +196,7 @@ fn main() {
             v.into_boxed_slice()
         })
         .collect();
-    let means: Vec<f64> = STATIONS.iter().map(|(_, m)| *m).collect();
+    let means: Vec<f64> = picked.iter().map(|(_, m)| *m).collect();
 
     let num_chunks = rows.div_ceil(ROWS_PER_CHUNK);
     let next_chunk = AtomicUsize::new(0);

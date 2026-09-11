@@ -1,0 +1,32 @@
+# v15_bounds against v12_pairs, plus the two Stage 0b brackets.
+#
+# Asking two things in one batch.
+#
+# 1. Does removing the three bounds-checked loads pay, when it is done without changing the
+#    loop's shape? v13 removed the same checks (and the table header reloads) via `first_chunk`
+#    returning Option and `probe_words` returning false, both of which add exits from the hot
+#    loop, and lost 15 ms. v15 removes only the checks, through raw-pointer windows feeding the
+#    same `_win` functions v13 added. Disassembly: the interleaved loop goes 214 -> 203
+#    instructions per two rows; 28 check instructions leave and the register allocator puts 19
+#    back as rematerialised constants.
+#
+#    Both thread counts, because the optimum stream count already differs between the core
+#    tiers and instruction count should matter more on the narrow ones.
+#
+# 2. What is the ~24 ms `v12_pairs` spends outside `main`? `null` is exec + dyld + runtime
+#    setup + teardown with no work; `spawn` adds 18 threads that set their QoS and return.
+#
+# Each binary is entered twice under two labels. Those pairs are the batch's noise floor and
+# nothing smaller than their spread may be read as a result.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v15 t18	OBRC_THREADS=18 ./target/release/v15_bounds measurements.txt >/dev/null
+v12 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v15 t18 (dup)	OBRC_THREADS=18 ./target/release/v15_bounds measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v15 t8	OBRC_THREADS=8 ./target/release/v15_bounds measurements.txt >/dev/null
+v12 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v15 t8 (dup)	OBRC_THREADS=8 ./target/release/v15_bounds measurements.txt >/dev/null
+null	./target/release/null
+null (dup)	./target/release/null
+spawn t18	OBRC_THREADS=18 ./target/release/spawn
+spawn t18 (dup)	OBRC_THREADS=18 ./target/release/spawn

@@ -98,6 +98,62 @@ pub fn parse_temp_branchless_win(w: &[u8; 8]) -> (i16, usize) {
     (value as i16, (dot_bit as usize >> 3) + 3)
 }
 
+/// [`parse_temp_branchless`] with the three digits folded into one multiply.
+///
+/// The digit combine above is the parser's last piece of long division. After the shift the
+/// three digits sit at bytes 1, 2 and 4, and it extracts them one at a time and reassembles
+/// them with two chained multiply-accumulates:
+///
+/// ```text
+///   ubfx w13, x12, #8,  #4      ubfx w14, x12, #16, #4      ubfx w15, x12, #32, #4
+///   mov  w16, #0xa              umaddl x14, w14, w16, x15
+///   mov  w16, #0x64             umaddl x13, w13, w16, x14
+/// ```
+///
+/// Seven instructions, two serialised multiplies, and two constants that have to live
+/// somewhere — and on this loop they do not fit, so LLVM rebuilds `#10` and `#100` inside the
+/// body and evicts `-LOW` to make room (see the v15 section of the README).
+///
+/// One multiply does the whole thing. Masking the shifted word leaves
+/// `d1 << 8 | d2 << 16 | d3 << 32`, and multiplying by `0x640A0001` — which is
+/// `100 << 24 | 10 << 16 | 1` — lines each digit's weight up with its byte position so that
+/// `d1*100 + d2*10 + d3` lands together at bit 32:
+///
+/// ```text
+///   and x13, x12, MASK          mul x13, x13, MUL
+///   lsr x13, x13, #32           and x13, x13, #0x3ff
+/// ```
+///
+/// The `& 0x3FF` is not a range assertion, it is load-bearing. The product also carries
+/// `d2*100` at bit 40 and `d3*10`/`d3*100` above that, and they vanish only because
+/// `100 << 8`, `10 << 16` and `100 << 24` are all multiples of 1024. Below bit 32 the largest
+/// term is `d1*10 << 24` ≤ `0x5A000000`, so nothing carries up into the answer either.
+///
+/// Four instructions for seven, one multiply for two, and the two constants it needs are
+/// loop-invariant instead of rematerialised per row.
+///
+/// This is royvanrijn's own combine; the project has been carrying the expanded form since v5.
+/// It went unmeasured for as long as the cost model said the value branch could not matter,
+/// which [`v16_newline`](../v16_newline/index.html) has since disproved.
+#[inline]
+pub fn parse_temp_branchless_mul(d: &[u8], p: usize) -> (i16, usize) {
+    let word = u64::from_le_bytes(d[p..p + 8].try_into().unwrap());
+    let inv = !word;
+
+    let dot_bit = (inv & 0x1010_1000).trailing_zeros();
+    let signed = ((inv << 59) as i64) >> 63;
+
+    let masked = word & !((signed as u64) & 0xFF);
+    let v = masked << (28 - dot_bit);
+
+    let digits = v & 0x0000_000F_000F_0F00;
+    let abs = ((digits.wrapping_mul(0x640A_0001) >> 32) & 0x3FF) as i64;
+
+    let value = (abs ^ signed) - signed;
+
+    (value as i16, p + (dot_bit as usize >> 3) + 3)
+}
+
 /// [`parse_temp_branchless`] for a caller that already knows where the line ends.
 ///
 /// `len` is the byte count from `p` to the `\n`, which a delimiter bitmap yields for free.
@@ -203,6 +259,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The magic multiply is only correct because three of the product's terms are multiples
+    /// of 1024 and a fourth cannot carry into bit 32. That is an argument, not a proof, so
+    /// check it the same way everything else here is checked: every legal value, every filler
+    /// the 8-byte window might see past the line, against the form it replaces.
+    #[test]
+    fn magic_multiply_agrees_with_the_expanded_combine() {
+        for (s, expected) in all_legal_values() {
+            for filler in [b'\n', b'x', b'0', b'9', b';', 0x00, 0xFF] {
+                let d = padded(&format!("{s}\n"), filler);
+                let got = parse_temp_branchless_mul(&d, 0);
+                assert_eq!(got.0, expected, "value of {s:?} with filler {filler:#04x}");
+                assert_eq!(got, parse_temp_branchless(&d, 0), "{s:?}/{filler:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn magic_multiply_parses_at_a_nonzero_offset() {
+        let d = padded("Abha;-12.3\n", b'x');
+        assert_eq!(parse_temp_branchless_mul(&d, 5), (-123, 11));
     }
 
     /// The length-driven form drops the dot search on the claim that `len - 2` always names

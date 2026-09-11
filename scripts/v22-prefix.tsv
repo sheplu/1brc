@@ -1,0 +1,61 @@
+# v22 against v21: is a register-file crossing worth eight vector operations?
+#
+# v21 removed 16.5 integer operations a row, twice v19's 7.5, and returned 8 ms where v19 returned
+# 23. The account written down for that gap was the crossing: v19's two extracts were outbound and
+# produced values the row wanted in general-purpose registers anyway, while v21 has to send `len`
+# back *into* the vector unit through a `dup` to build its lane mask. That is an argument, not a
+# measurement, and this batch is what decides it.
+#
+# v22 builds the same mask with a prefix-OR across the `cmeq` result — four `ext`/`orr` pairs, then
+# one `bic` — so the key never depends on `len` and the `dup` is gone. Nothing else changes; the
+# full-dataset output is byte-identical to v21's 10664.
+#
+# Building it also corrected scripts/loopcount.py, which classified by mnemonic and had `orr.16b`
+# filed as `const` and `ext.16b` as `other`. Eight of v22's vector operations were landing in the
+# integer column, and `dup.16b v1, w4` — the very instruction this experiment is about — was filed
+# as ordinary vector work. It now decides by which register files an instruction names. Corrected
+# counts, † marking what moved:
+#
+#                 insns/row   integer/row   vector/row   xfer/row   inbound   measured vs v12
+#   v12               107.0          79.5          0.0        0.0         0                 —
+#   v19               105.0        † 72.0          2.0      † 2.0         0            -23 ms
+#   v20                95.5        † 69.5          2.0      † 2.0         0            -16 ms
+#   v21                91.5        † 55.5        † 5.0      † 5.0         1             -8 ms
+#   v22                97.5          55.5         13.0        4.0         0                 ?
+#
+# That also says v19 added two crossings rather than none, so the number in its write-up is wrong
+# even though the qualitative claim — outbound, feeding registers the row needed anyway — holds.
+#
+# Why this arm is worth a batch: the integer column does not move. 55.5 in both. Every previous
+# version here changed the integer count and the vector count together, so no measurement could
+# say which one it had bought. This one pins the integer side exactly and varies only the vector
+# and crossing mix.
+#
+# The models disagree, which is the point. Instruction count (retired by v20) says +6.0 a row, so
+# slower. Integer operations (retired by v21) says nothing at all. Crossings, the live one, says
+# faster. And a fourth reading says slower for its own reason: the prefix-OR is itself a serial
+# chain, four dependent `ext`/`orr` pairs at roughly two cycles each, so about sixteen cycles to
+# the mask where v21's `dup -> cmhi -> and` is about eight once `len` exists. v22 wins only if
+# detaching the key from `len` is worth more than lengthening the key's own path.
+#
+# Nothing there supports a number. Band written down in advance: -10 to +10 ms. The informative
+# result is the sign and whether it clears the duplicate-arm spread.
+#
+# What each outcome means. Faster past the spread: crossings are a real term, the inbound ones
+# especially, and v21's missing prediction is partly explained. Inside the spread: crossings are
+# not the term either, three models are retired, and the loop is bound on something nobody here
+# has named — most likely the dependent table load the whole chain terminates in. Slower by about
+# the instruction count: the vector unit no longer has the slack v19 assumed, which dates the
+# "completely idle" claim every version since has been resting on and closes this whole direction.
+#
+# REPS=7, matching the v21 batch. v21 and v22 are each entered twice under two labels at 18
+# threads; those two spreads are the batch's noise floor and nothing smaller may be read.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t18	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v21 t18	OBRC_THREADS=18 ./target/release/v21_vmask measurements.txt >/dev/null
+v22 t18	OBRC_THREADS=18 ./target/release/v22_prefix measurements.txt >/dev/null
+v21 t18 (dup)	OBRC_THREADS=18 ./target/release/v21_vmask measurements.txt >/dev/null
+v22 t18 (dup)	OBRC_THREADS=18 ./target/release/v22_prefix measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v21 t8	OBRC_THREADS=8 ./target/release/v21_vmask measurements.txt >/dev/null
+v22 t8	OBRC_THREADS=8 ./target/release/v22_prefix measurements.txt >/dev/null
