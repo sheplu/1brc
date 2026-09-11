@@ -42,10 +42,15 @@
 //! ```text
 //!                  insns/row   integer/row   vector+xfer/row   measured vs v12
 //!   v12                107.0          79.5                 0                 —
-//!   v19                105.0          73.0               3.0            −23 ms
-//!   v20                 95.5          70.5               3.0             −7 ms
-//!   v21                 91.5          56.5               9.0                 ?
+//!   v19                105.0          72.0               4.0            −23 ms
+//!   v20                 95.5          69.5               4.0             −7 ms
+//!   v21                 91.5          55.5              10.0                 ?
 //! ```
+//!
+//! (Those integer figures are one lower than this section originally carried. `loopcount.py`
+//! classified by mnemonic and filed `mov.d x9, v0[1]` — a vector lane being read into a
+//! general-purpose register — under `const`. [`v22_prefix`](../v22_prefix/index.html) fixed it to
+//! decide by register file. The deltas are unaffected: every version here lost the same one.)
 //!
 //! 91.5 is the smallest this loop has ever compiled to, and 56.5 integer operations a row is a
 //! different order of change from anything before it — v19 won 23 ms for 6.5, and this is 16.5.
@@ -73,17 +78,23 @@
 //! model this loop has broken:
 //!
 //! ```text
-//!         integer ops removed   crossings added   measured
-//!   v19                   6.5                 0     −23 ms
-//!   v21                  16.5                 2      −8 ms
+//!         integer ops removed   crossings added   of which inbound   measured
+//!   v19                   7.5                 2                  0     −23 ms
+//!   v21                  16.5                 3                  1      −8 ms
 //! ```
 //!
-//! A "crossing" is a register-file transfer that did not exist before. v19 added none: the `cmeq`
-//! ran on bytes already in a vector register, and the two extracts it needed produced values the
-//! row wanted in general-purpose registers anyway. v21 has to send `len` *back* the other way —
-//! `ctz` computes it in a GPR, `dup.16b` returns it to the vector unit to build the lane mask,
-//! and the masked words come out again. The count shows it plainly: transfers go from 1.0 a row
-//! to 3.0.
+//! A "crossing" is a register-file transfer that did not exist before, and the column that
+//! matters is the third one. v19's two are `fmov x8, d0` and `mov.d x9, v0[1]`, both *outbound*:
+//! the `cmeq` ran on bytes already in a vector register, and its extracts produced values the row
+//! wanted in general-purpose registers anyway. v21 has to send `len` *back* the other way — `ctz`
+//! computes it in a GPR, `dup.16b` returns it to the vector unit to build the lane mask, and the
+//! masked words come out again. Transfers go from 2.0 a row to 5.0, and one of the three added is
+//! the round trip.
+//!
+//! ([`v22_prefix`](../v22_prefix/index.html) later put a price on that round trip: it builds the
+//! same mask with a prefix-OR, deletes the `dup` and nothing else, and is 6 ms faster. It also
+//! corrected the crossing counts above, which this section originally gave as 0 and 2 because
+//! `loopcount.py` was classifying by mnemonic.)
 //!
 //! And they are in series. The row's chain is now
 //! `ldr q → cmeq → shrn → fmov → ctz → dup → cmhi → and.16b → fmov → hash`, where v19's was
@@ -96,13 +107,16 @@
 //! **integer operations removed at no additional crossing**. v19 is the only change so far that
 //! managed that, which is why it is still the largest single win.
 //!
-//! **What this names next.** The detour is avoidable. The prefix mask does not have to be built
-//! from `len`: a prefix-OR across the `cmeq` result — four `ext`/`orr` pairs, then one `bic` —
-//! marks every lane at or after the first `;` without a scalar ever being involved, so `klo` and
-//! `khi` stop depending on `len` and the `dup` disappears. Two chains in parallel instead of one
-//! long one, and the crossing count goes back to v19's. If the account above is right that should
-//! recover a real part of the missing prediction; if it lands at −8 again, crossings are not the
-//! term either and this loop is bound on something nobody here has named yet.
+//! **What this named next, and what came back.** The detour is avoidable. The prefix mask does not
+//! have to be built from `len`: a prefix-OR across the `cmeq` result — four `ext`/`orr` pairs, then
+//! one `bic` — marks every lane at or after the first `;` without a scalar ever being involved, so
+//! `klo` and `khi` stop depending on `len` and the `dup` disappears.
+//!
+//! [`v22_prefix`](../v22_prefix/index.html) is that version and it returned **−6 ms** on a 1 ms
+//! duplicate spread, with the integer column held at exactly 55.5 and eight *more* vector
+//! operations a row. So the crossing is a real term and it is the first thing this project
+//! predicted before measuring. It is also only 6 of the missing 12 to 47: crediting it back still
+//! leaves v19 at three times v21's rate per integer operation removed.
 //!
 //! Usage: v21_vmask [path]   (OBRC_THREADS, default 8; OBRC_TABLE_BITS, default 14)
 

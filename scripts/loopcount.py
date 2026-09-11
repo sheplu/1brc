@@ -9,8 +9,8 @@ before the benchmark ran.
 Finding the loop without hand-picking addresses, and without a symbol name — `worker` is
 inlined into an unnameable spawn closure. Disassemble every function, drop the instructions
 only reachable from a `bl` (the `#[cold]` fixups, which otherwise get counted as loop body),
-take every backward branch as a candidate loop, and keep the smallest one holding exactly six
-`ctz`: two rows' worth of the scan's two and the parser's one.
+take every backward branch as a candidate loop, and keep the smallest one that looks like two
+rows of this program: see `MIN_MUL` below.
 
 Usage: scripts/loopcount.py target/release/v12_pairs [...]
 """
@@ -26,10 +26,23 @@ CATEGORIES = [
     ("const", r"^(mov|movk|movz|movn|orr)$"),
     ("load", r"^(ldr|ldp|ldrb|ldrh|ldrsh|ldrsw|ldur|ldurb|ld1|ldursw)$"),
     ("store", r"^(str|stp|strb|strh|stur|st1)$"),
-    ("vector", r"^(cmeq|dup|umov|shrn|tbl|movi|cmhi|bic\.16b|and\.16b)$"),
-    ("xfer", r"^(fmov)$"),
     ("branch", r"^(b|bl|br|cbz|cbnz|tbz|tbnz|b\.\w+)$"),
 ]
+
+#: `vector` and `xfer` are decided by the *operands*, not the mnemonic, and are tested before
+#: the table above. Naming mnemonics was wrong twice and both times in the direction that
+#: flattered the argument being made: `orr.16b` fell through to `const` and `ext.16b` to `other`,
+#: putting eight of v22's vector operations in the integer column, and `dup.16b v1, w4` — a
+#: general-purpose register being written *into* the vector file — was filed as plain vector work
+#: while the whole v21 write-up turned on counting exactly that. There are too many spellings of
+#: a NEON instruction to enumerate, and only one structural question worth asking: which register
+#: files does this instruction touch?
+#:
+#: So: an instruction naming both a GPR and a vector register moves data between the two files
+#: and is a crossing, and one naming only vector registers is vector work. Loads, stores and
+#: branches are settled first, because `ldr q0, [x8]` names both and crosses nothing.
+GPR = re.compile(r"\b[wx](\d+|zr|sp)\b")
+VEC = re.compile(r"\b[vqdsh]\d+\b")
 
 BACKWARD = re.compile(r"^b(\.\w+)?$|^cb(n)?z$|^tb(n)?z$")
 
@@ -128,27 +141,42 @@ def hot_loop(path):
     return min(cands, key=lambda l: len(l[2])) if cands else None
 
 
+def classify(op, operands):
+    """One bucket per instruction. Register files first, mnemonics second."""
+    base = op.split(".")[0]
+    for name, pat in CATEGORIES:
+        if name in ("load", "store", "branch") and (re.match(pat, op) or re.match(pat, base)):
+            return name
+    # objdump annotates branch and literal targets with `<symbol+0x..>`; those are not registers.
+    bare = re.sub(r"<[^>]*>", "", operands)
+    if VEC.search(bare):
+        return "xfer" if GPR.search(bare) else "vector"
+    for name, pat in CATEGORIES:
+        if re.match(pat, op) or re.match(pat, base):
+            return name
+    return "other"
+
+
 def report(path):
     found = hot_loop(path)
     if not found:
-        print(f"{path}: no six-`ctz` loop with multiplies in it")
+        print(f"{path}: nothing shaped like two rows of this program")
         return
     start, end, span = found
 
     counts = {}
-    for _, op, _ in span:
-        base = op.split(".")[0]
-        for name, pat in CATEGORIES:
-            if re.match(pat, op) or re.match(pat, base):
-                counts[name] = counts.get(name, 0) + 1
-                break
-        else:
-            counts["other"] = counts.get("other", 0) + 1
+    for _, op, operands in span:
+        counts[classify(op, operands)] = counts.get(classify(op, operands), 0) + 1
 
     n = len(span)
     print(f"{path.split('/')[-1]:16} {start:#x}..{end:#x}  {n} insns / 2 rows = {n / 2:.1f} per row")
-    order = [k for k, _ in CATEGORIES] + ["other"]
+    order = [k for k, _ in CATEGORIES] + ["vector", "xfer", "other"]
     print("   " + "  ".join(f"{k} {counts.get(k, 0) / 2:.1f}" for k in order))
+
+    # The column every cost model in the README is fitted against: everything that occupies an
+    # integer ALU slot, which is the total less the work that occupies something else.
+    elsewhere = sum(counts.get(k, 0) for k in ("load", "store", "branch", "vector", "xfer"))
+    print(f"   integer {(n - elsewhere) / 2:.1f}")
 
 
 if __name__ == "__main__":
