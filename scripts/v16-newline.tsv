@@ -1,0 +1,40 @@
+# v16_newline and v17_cursors against v12_pairs.
+#
+# Asking one question in two forms: does taking the next row's start from the `\n` instead of
+# from the value pay for itself?
+#
+# v12's loop carries `pos` through two `trailing_zeros` in series with a load between them, and
+# that middle load's *address* is what the first `ctz` produces — it cannot issue until the `;`
+# has been found:
+#
+#   pos -> load 8B -> semi mask -> ctz -> len -> load 8B at semi+1 -> dot mask -> ctz -> pos'
+#
+# v16 replaces that with a 24-byte newline scan whose three loads are all `pos` plus a constant,
+# so they issue together and the recurrence collapses to one `ctz`. The value is still parsed,
+# but off the chain. The trade is roughly six cycles of latency against 36 more instructions a
+# row — 107 -> 143, three times the adder that was budgeted for it.
+#
+# v17 is v16 with the two stream cursors in named locals rather than an array. At v16's body
+# size LLVM tail-merged the pair loop with the two drain loops and reached the streams through a
+# rotating pointer, which put `pos` through a store-to-load round trip every row — four to six
+# cycles onto the very recurrence v16 exists to shorten. v12 has the identical source shape and
+# keeps both cursors in registers. So v16 measures the idea as LLVM chose to compile it, and v17
+# measures the idea. If they come back level, the tail-merge was free and v17 is not needed.
+#
+# Both thread counts: the pair loop's optimum already differs between the two core tiers, and a
+# change this large in instruction count should land differently on the narrow ones.
+#
+# Each binary is entered twice under two labels. Those pairs are the batch's noise floor and
+# nothing smaller than their spread may be read as a result.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v16 t18	OBRC_THREADS=18 ./target/release/v16_newline measurements.txt >/dev/null
+v17 t18	OBRC_THREADS=18 ./target/release/v17_cursors measurements.txt >/dev/null
+v12 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v16 t18 (dup)	OBRC_THREADS=18 ./target/release/v16_newline measurements.txt >/dev/null
+v17 t18 (dup)	OBRC_THREADS=18 ./target/release/v17_cursors measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v16 t8	OBRC_THREADS=8 ./target/release/v16_newline measurements.txt >/dev/null
+v17 t8	OBRC_THREADS=8 ./target/release/v17_cursors measurements.txt >/dev/null
+v12 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v16 t8 (dup)	OBRC_THREADS=8 ./target/release/v16_newline measurements.txt >/dev/null
+v17 t8 (dup)	OBRC_THREADS=8 ./target/release/v17_cursors measurements.txt >/dev/null
