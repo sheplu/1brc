@@ -87,11 +87,21 @@
 //! other way: it is 9.5 instructions a row *smaller* than v19 and 16 ms slower.
 //!
 //! **What later qualified this.** [`v21_vmask`](../v21_vmask/index.html) applies the same argument
-//! to the key mask, removes 16.5 integer operations a row where v19 removed 6.5, and returns 8 ms
-//! where v19 returned 23. So the integer column is not a rate either. What is special about v19 is
-//! that it added no register-file crossings: the `cmeq` ran on bytes already in a vector register
-//! and its extracts produced values the row wanted in GPRs anyway. v21 has to send `len` back into
-//! the vector unit to build its lane mask, and pays for the round trip.
+//! to the key mask, removes 16.5 integer operations a row where v19 removed 7.5, and returns 8 ms
+//! where v19 returned 23. So the integer column is not a rate either.
+//!
+//! What is special about v19 is the *direction* of the crossings it added, not their number. It
+//! added two — `fmov x8, d0` and `mov.d x9, v0[1]`, the two extracts of the compare — and both are
+//! outbound, producing the delimiter masks in the general-purpose registers where
+//! `trailing_zeros` needs them anyway. v21 has to send `len` back the other way through a `dup` to
+//! build its lane mask, and [`v22_prefix`](../v22_prefix/index.html) later measured that one
+//! inbound round trip at 6 ms by deleting it and changing nothing else.
+//!
+//! The "added no crossings" claim this section used to make was a counting error, not a judgement
+//! call: `scripts/loopcount.py` classified by mnemonic and filed `mov.d x9, v0[1]` under `const`.
+//! The corrected integer counts are 79.5 for v12 and 72.0 here, so the removal is 7.5 rather than
+//! 6.5. Neither correction changes the finding — the vector unit was idle and using it was free —
+//! and both are recorded because the crossing table in the README is built out of them.
 //!
 //! Everything else is v12: two interleaved streams, `pread` into a recycled per-thread buffer,
 //! the fixed 16-byte `;` window, no final avalanche, the keyed probe, a table that grows on

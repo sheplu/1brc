@@ -7,8 +7,8 @@ benchmarked against the ones before it.
 
 **76.6 s → 0.36 s.** No external crates: the syscalls are hand-written `extern "C"`, the threading
 is `std::thread`, and the hot loop is SWAR in plain `u64` apart from the delimiter search and the
-key mask, which are half a dozen NEON instructions. The 207× in the ratio is from a single batch
-that read 76.6 s and 370 ms; the 22 ms below that came later, across three batches of their own,
+key mask, which are a dozen-odd NEON instructions. The 207× in the ratio is from a single batch
+that read 76.6 s and 370 ms; the 23 ms below that came later, across four batches of their own,
 because on this machine numbers from different batches are not comparable.
 
 ## Results
@@ -33,7 +33,8 @@ oracle's on the full dataset.
 | `v11_keyed` | the probe key falls out of the scan | **685 ms** | 398 ms |
 | `v12_pairs` | 2 interleaved line streams instead of 3 | 711 ms | 381 ms |
 | `v19_vecscan` | the two `;` masks come from one vector compare | 678 ms | 365 ms |
-| **`v21_vmask`** | **the key mask becomes a lane compare, so the `csel`s go** | **662 ms** | **359 ms** |
+| `v21_vmask` | the key mask becomes a lane compare, so the `csel`s go | 662 ms | 359 ms |
+| **`v22_prefix`** | **the key mask off a prefix-OR, so no scalar re-enters the vector unit** | **667 ms** | **358 ms** |
 | ~~`v13_hoist`~~ | ~~table header hoisted, bounds checks removed~~ | 724 ms | 393 ms |
 | ~~`v15_bounds`~~ | ~~v13's bounds checks only, no control-flow change~~ | 681 ms | 381 ms |
 | ~~`v16_newline`~~ | ~~next row taken from the `\n`, not from the value~~ | 716 ms | 413 ms |
@@ -41,8 +42,8 @@ oracle's on the full dataset.
 | ~~`v18_thrift`~~ | ~~magic-multiply digits, key mask off `trailing_zeros`~~ | 675 ms | 383 ms |
 | ~~`v20_vecbounds`~~ | ~~v19 plus v15: the smallest loop, and slower than v19~~ | 702 ms | 376 ms |
 
-18 threads — every core — is the headline: **359 ms**. 8 threads is the ladder's comparison
-baseline, and v21's 662 there is the first number that clears v11's 685 by more than a batch
+18 threads — every core — is the headline: **358 ms**. 8 threads is the ladder's comparison
+baseline, and the 662–667 there is the first number that clears v11's 685 by more than a batch
 effect — though those two are still from different batches and this README does not compare
 across batches. What can be said is that v19's batch and the ladder's agree on v12 at 8 threads
 to the millisecond (711), which makes it worth a run rather than a claim. (`v1_naive` is the one number
@@ -59,6 +60,10 @@ read 704/703 and 383/384, then 711/708 and 384/387; against its own control v19 
 threads and −32 at 8**, not the −22/−33 mixed baselines would suggest. v21 is from
 `scripts/v21-vmask.tsv`, which read v12 at 708 and 390 — about 1.5% slow throughout — so v19's
 row above is that batch's 676/365 and v21 is **−14 ms at 8 threads and −8 at 18** against it.
+v22 is from `scripts/v22-prefix.tsv`, which is slower still: v12 at 722 and 401, some 4% off. Its
+v21 arms read 672 and 364/365, so **v22 is −5 ms at 8 threads and −6 at 18** against its own
+control, and the two rows above being 5 ms apart in the other direction at 8 threads is precisely
+the batch effect this section exists to warn about.
 
 **Every number in this table is ~10-15 ms too high, including that one.** `batch.sh` times
 `subprocess.run(..., shell=True)`, so it charges each run a Python `fork`/`exec` and a `/bin/sh`
@@ -77,16 +82,21 @@ v13 is in the table because it is struck through. It removes 20 instructions per
 slower for it, in four separate batches now; it is kept in the tree as a counterexample and nothing
 ships it. See below.
 
-v19, v20 and v21 are the newest group and they are best read together. v19 does one thing — the
+v19 through v22 are the newest group and they are best read together. v19 does one thing — the
 two `;` masks come from a single `cmeq` against a splat, instead of `eor`/`sub`/`bic`/`and` twice —
 and it is worth 2.0 instructions a row and 24 ms. v20 is v19 with v15's range-check removal folded
 in; at 95.5 instructions a row against v12's 107.0 it was the smallest loop this project had ever
 compiled, and it is 16 ms *slower* than v19. v21 moves the key mask the same way v19 moved the
-compare, reaches 91.5, removes two and a half times as much integer work as v19 did — and returns
-8 ms, not the 20 to 55 that was predicted. The three together are what "The loop is bound on
-integer throughput" and "Integer operations are not a rate either" below are about. Between them
-they retire the register-pressure account that v13, v15 and v18 had built up, then retire
-instruction count as a target, then retire integer-operation count as a rate.
+compare, reaches 91.5, removes over twice as much integer work as v19 did — and returns 8 ms, not
+the 20 to 55 that was predicted. v22 then builds the same mask a second way, one that never sends
+a scalar back into the vector unit: it is *larger* than v21 by 6 instructions a row, identical to
+it in the integer column, and 6 ms faster.
+
+The four together are what "The loop is bound on integer throughput", "Integer operations are not
+a rate either" and "A crossing has a price" below are about. Between them they retire the
+register-pressure account that v13, v15 and v18 had built up, then retire instruction count as a
+target, then retire integer-operation count as a rate — and then find one term that does hold up,
+by predicting it in advance instead of fitting it afterwards.
 
 The last three rows are not the same kind of result. v10 removes five serial operations from the
 hot loop and the *engine* gets 3–4% faster for it in every batch it has been measured in; the
@@ -156,7 +166,9 @@ which is most of why `parse`'s share went up while its absolute cost went down.
 Every column but `parse` is the same to within its own run-to-run spread, which is what v19 should
 look like: one `cmeq` in the row, nothing touched outside it. The 24 ms it wins comes out of the
 parse row and only the parse row. v21 is the same again — run interleaved against v19, three times
-each, its `read` is identical and its `parse` is about 4 ms lower per thread.
+each, its `read` is identical and its `parse` is about 4 ms lower per thread. And v22 again against
+v21: `read` 54.0 against 54.0 ms, `parse` 277.5 against 290.8. Three changes to the row, three
+times the entire difference showing up in the one row that describes the row.
 
 The first two rows used to be one row reading `outside main — 24 ms`, described here as "the
 largest thing here nobody has moved". Nobody had moved it because most of it was not there.
@@ -857,8 +869,8 @@ vector work out of the counts and a different column lines up:
 |---|---:|---:|---:|
 | v12 | 107.0 | 79.5 | — |
 | v15 | 101.5 | 80.5 | +4 ms |
-| v19 | 105.0 | 73.0 | −23 ms |
-| v20 | 95.5 | 70.5 | −7 ms |
+| v19 | 105.0 | 72.0 | −23 ms |
+| v20 | 95.5 | 69.5 | −7 ms |
 
 The eight `eor`/`sub`/`bic`/`and` a row were never eight instructions' worth of cost. They were
 eight *integer ALU slots* on a loop that has none spare, and a `cmeq` on a completely idle vector
@@ -880,7 +892,7 @@ with `SEMI` and `LOW` out of the file entirely. The second is the cleaner one, b
 only control — one call differs — and every rematerialisation v15's loss was blamed on is gone
 from it. `cmn`/`cmp`/`b.hi` are the loop's cheapest and most predictable slots, the code that
 replaces them still computes the same addresses, and the freed room goes straight into rebuilding
-`SEED` four instructions a row: the integer column only falls 73.0 → 70.5 while the instruction
+`SEED` four instructions a row: the integer column only falls 72.0 → 69.5 while the instruction
 count falls by 9.5.
 
 **What this retires.** "Fewer instructions per row" as a goal, in both directions — v18 established
@@ -913,13 +925,13 @@ bit-identical; nothing downstream of the scan changes at all.
 | | insns/row | integer ops/row | vector+xfer/row |
 |---|---:|---:|---:|
 | v12 | 107.0 | 79.5 | 0 |
-| v19 | 105.0 | 73.0 | 3.0 |
-| v20 | 95.5 | 70.5 | 3.0 |
-| **v21** | **91.5** | **56.5** | 9.0 |
+| v19 | 105.0 | 72.0 | 4.0 |
+| v20 | 95.5 | 69.5 | 4.0 |
+| **v21** | **91.5** | **55.5** | 10.0 |
 
-91.5 is the smallest this loop has ever compiled to, and −16.5 integer operations a row is two and
-a half times v19's −6.5. Straight-lining v19's own rate gives −58 ms; the batch header refused to
-write that down and predicted a wide **−20 to −55**.
+91.5 is the smallest this loop has ever compiled to, and −16.5 integer operations a row is over
+twice v19's −7.5. Straight-lining v19's own rate gives −58 ms; the batch header refused to write
+that down and predicted a wide **−20 to −55**.
 
 | `scripts/v21-vmask.tsv`, REPS=7 | v12 | v19 | v21 |
 |---|---:|---:|---:|
@@ -930,39 +942,111 @@ write that down and predicted a wide **−20 to −55**.
 fastest version — but a third to a seventh of a prediction that was already hedged wide. So the
 integer column is not a rate either, and that is now the third cost model this loop has broken:
 
-| | integer ops removed | crossings added | measured |
-|---|---:|---:|---:|
-| v19 | 6.5 | 0 | **−23 ms** |
-| v21 | 16.5 | 2 | **−8 ms** |
+| | integer ops removed | crossings added | of which inbound | measured |
+|---|---:|---:|---:|---:|
+| v19 | 7.5 | 2 | 0 | **−23 ms** |
+| v21 | 16.5 | 3 | 1 | **−8 ms** |
 
-A *crossing* is a register-file transfer that did not exist before. v19 added none: the `cmeq` ran
-on bytes already sitting in a vector register, and the two extracts it needed produced values the
-row wanted in general-purpose registers anyway. v21 has to send a scalar back the other way —
-`ctz` computes `len` in a GPR, `dup.16b` returns it to the vector unit to build the lane mask, and
-the masked words come out again. Transfers per row go 1.0 → 3.0, and they are in series:
+A *crossing* is a register-file transfer that did not exist before, and the column that matters is
+the third. v19's two are `fmov x8, d0` and `mov.d x9, v0[1]`, both *outbound*: the `cmeq` ran on
+bytes already sitting in a vector register, and its extracts produced the delimiter masks in the
+general-purpose registers where `trailing_zeros` needs them anyway. v21 has to send a scalar back
+the other way — `ctz` computes `len` in a GPR, `dup.16b` returns it to the vector unit to build the
+lane mask, and the masked words come out again. Transfers per row go 2.0 → 5.0, and they are in
+series:
 
 ```text
   v19   ldr q → cmeq → umov → ctz → lsl → sub → and → hash
   v21   ldr q → cmeq → shrn → fmov → ctz → dup → cmhi → and.16b → fmov → hash
 ```
 
-Four of the added links are register-file crossings at roughly four cycles apiece. v21 bought
-sixteen integer ALU slots by inserting something like a fifteen-cycle detour on the chain those
-slots were sitting on, and came out ahead — barely. The unit of account is therefore neither
-instructions (which v20 retired) nor integer operations (which this retires) but **integer
-operations removed at no additional crossing.** v19 is the only change so far that managed it,
-which is why it is still the largest single win.
-
-That is a testable account rather than a story, because the detour is avoidable. A prefix-OR
-across the `cmeq` result — four `ext`/`orr` pairs, then one `bic` — marks every lane at or after
-the first `;` with no scalar ever involved, so `klo` and `khi` stop depending on `len`, the two
-chains run in parallel, and the crossing count goes back to v19's. If crossings are the term, that
-should recover a real part of the missing prediction. If it lands at −8 again, they are not, and
-this loop is bound on something nobody here has named yet.
+v21 bought sixteen integer ALU slots by inserting something like a fifteen-cycle detour on the
+chain those slots were sitting on, and came out ahead — barely. The unit of account is therefore
+neither instructions (which v20 retired) nor integer operations (which this retires) but **integer
+operations removed at no additional crossing.**
 
 Also still open on the original list: v18's magic multiply was rejected because its two constants
 did not fit, and v21's register file is the emptiest one this project has produced — three of the
 five pinned constants are now in vector registers or gone.
+
+### A crossing has a price — v22, and the first prediction that held
+
+The paragraph above is a testable account rather than a story, because the detour is avoidable. The
+prefix mask does not have to be built from `len`. `vextq_u8(zero, p, 16 - k)` is a left shift by
+`k` lanes, and four of them at k = 1, 2, 4, 8 propagate every set lane of the `cmeq` forward into
+all higher ones; a `bic` then keeps exactly the bytes before the first `;`. No scalar is involved
+at any point, so `klo` and `khi` stop depending on `len` and the `dup` disappears.
+
+**Writing it corrected the instrument first.** `scripts/loopcount.py` classified by mnemonic, and
+two of its buckets were wrong in the direction that flattered the argument they were supporting:
+`orr.16b` fell through to `const` and `ext.16b` to `other`, so eight of v22's vector operations
+would have been counted as integer work — and `dup.16b v1, w4`, a general-purpose register being
+written *into* the vector file, was filed as ordinary vector work even though the whole v21
+write-up turned on counting exactly that. It now decides by which register files an instruction
+names, which is the only structural question there is. Every integer and crossing figure in the two
+sections above is the corrected one; the pre-correction text said v19 added *no* crossings, and it
+added two.
+
+| | insns/row | integer/row | vector/row | xfer/row | inbound |
+|---|---:|---:|---:|---:|---:|
+| v12 | 107.0 | 79.5 | 0.0 | 0.0 | 0 |
+| v19 | 105.0 | 72.0 | 2.0 | 2.0 | 0 |
+| v20 | 95.5 | 69.5 | 2.0 | 2.0 | 0 |
+| v21 | 91.5 | 55.5 | 5.0 | 5.0 | **1** |
+| **v22** | **97.5** | **55.5** | 13.0 | 4.0 | 0 |
+
+**The integer column does not move.** That has never happened here before — every previous version
+changed the integer count and the vector count together, so no measurement could say which one it
+had paid for. v22 pins the integer side at exactly 55.5 and varies only the vector and crossing
+mix, which makes the three models disagree out loud: instruction count says +6.0 a row and
+therefore slower, integer operations say nothing at all, and crossings say faster. A fourth reading
+says slower for its own reason — the prefix-OR is itself a serial chain, four dependent `ext`/`orr`
+pairs at roughly two cycles each, about sixteen cycles to the mask where v21's `dup → cmhi → and`
+is about eight once `len` exists. Band written into the batch header in advance: **−10 to +10 ms**.
+
+| `scripts/v22-prefix.tsv`, REPS=7 | v12 | v19 | v21 | v22 |
+|---|---:|---:|---:|---:|
+| 18 threads | 401 ms | 375 ms | 365 / 364 ms | **359 / 358 ms** |
+| 8 threads | 722 ms | — | 672 ms | **667 ms** |
+
+**−6 ms at 18 threads and −5 at 8, on duplicate spreads of 1 ms in both pairs.** Six times the
+noise floor. (This batch reads v12 at 401 against the previous two's 390 and 384, so the machine is
+some 4% slow and only the within-batch ordering is quoted — it is monotone.)
+
+So the crossing model is the only one of the three that got the sign right, and an inbound
+register-file crossing on the row's critical path is worth about 6 ms here. It is also the first
+term this project has *predicted* before measuring rather than fitted afterwards, which is the
+difference between a model and a description.
+
+It does not rescue the integer column. Crediting v21 with the 6 ms it was losing to the `dup`:
+
+| | integer removed | crossings added | measured | per integer op |
+|---|---:|---:|---:|---:|
+| v19 vs v12 | 7.5 | 2 outbound | −23 ms | −3.1 ms |
+| v21 vs v19 | 16.5 | 2 out, 1 inbound | −10.5 ms | −0.6 ms |
+| v21 vs v19, less the `dup` | 16.5 | 2 outbound | −16.5 ms | −1.0 ms |
+
+v19 is still three times the rate per integer operation removed with the crossings netted out. The
+gap narrowed; it did not close.
+
+**And the vector unit still has slack.** Thirteen vector operations a row against v19's two, eight
+more than v21, and the row got *faster*. Every version since v19 has rested on the premise that the
+unit beside the integer ALUs is idle, and this is the first evidence for it that is not v19's own
+arm.
+
+**What that leaves.** Three crossings a row survive and all are outbound, so the cheap version of
+this trick is spent. Two of the three exist only because `upsert_words` compares the key in
+general-purpose registers; laying the stored key out for a `cmeq`/`bic` comparison would delete
+both, and would be the first change to touch the table rather than the scan. The third is a value
+LLVM parks in `d0` and reloads — register pressure relieved through the vector file instead of the
+stack, which is the v13/v15/v18 fixed point showing up in a new place rather than a target.
+
+Underneath all of it is the one axis this project has never varied. The row's chain terminates in a
+dependent load from a table whose 413 live entries occupy 413 distinct 128-byte lines: 53 KB against
+the 64 KB L1d on twelve of this machine's eighteen cores. `OBRC_TABLE_BITS` sweeps flat from 2^13 to
+2^16 because changing the slot count does not change the live-set footprint — only the entry layout
+does. `scripts/v15-footprint.tsv` varies the station count and is the closest thing to a measurement
+of this that exists here; nothing has yet varied the bytes per entry.
 
 Ablations, warm reader at 18 threads, from a batch of their own where the spreads were tight
 (`keyed2` 333–351, `hot2` 349–357):
@@ -1093,7 +1177,8 @@ scripts/batch.sh scripts/v18-thrift.tsv                  # v18: the same rate, m
 scripts/batch.sh scripts/v20-vecbounds.tsv               # v19 and v20: it is the integer ports
 scripts/batch.sh scripts/v19-confirm.tsv                 # v19 again, because 24 ms needed it
 scripts/batch.sh scripts/v21-vmask.tsv                   # v21: and integer ops are not a rate
-scripts/loopcount.py target/release/v21_vmask            # the hot loop, counted by category
+scripts/batch.sh scripts/v22-prefix.tsv                  # v22: what an inbound crossing costs
+scripts/loopcount.py target/release/v22_prefix           # the hot loop, counted by register file
 ```
 
 `scripts/batch.sh` is the only sanctioned way to compare two numbers here: it refuses to start on
@@ -1148,10 +1233,10 @@ byte-identical to what it always was.
   only way to measure the noise floor rather than assume it.
 - For scale: the official Java winner is 1.535 s on 8 Zen2 cores, and the fastest known solution in
   any language is [austindonisan's C](https://github.com/austindonisan/1brc) at 0.577 s on that same
-  8-core machine. This does 685 ms on 8 cores of an M5 Pro — different silicon, so not a ranking,
-  but it does mean roughly 1.19× per core still separates this from the state of the art, down from
-  1.4× before v14 and 2× before v11. (685 ms is v11; v12's two streams are tuned for 18 threads and
-  cost 26 ms at 8.) The obvious explanation was his one big technique — parsing many rows at once
+  8-core machine. This does 667 ms on 8 cores of an M5 Pro — different silicon, so not a ranking,
+  but it does mean roughly 1.16× per core still separates this from the state of the art, down from
+  1.4× before v14 and 2× before v11. (667 ms is v22, in a batch that read v12 4% slow; v11's 685 is
+  the ladder's, and v12's two streams are tuned for 18 threads and cost it 26 ms at 8.) The obvious explanation was his one big technique — parsing many rows at once
   off SIMD delimiter masks rather than one at a time — and that turns out not to be it: ported to
   NEON and measured, it is 23% slower than what ships here (above). Whatever the remaining 1.19×
   is, this project has not found it yet.

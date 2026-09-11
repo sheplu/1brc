@@ -382,6 +382,82 @@ pub fn scan_flat_keyed_vmask(data: &[u8], pos: usize) -> Option<(usize, u64, u64
     Some((pos + len, mix(prev, last), klo, khi))
 }
 
+/// [`scan_flat_keyed_vmask`] with the lane mask built from the compare rather than from `len`.
+///
+/// v21 measured the vector masking as worth 8 ms where the integer-operation count predicted 20
+/// to 55. The account it gives is that the mask is built from a *scalar*: `ctz` produces `len` in
+/// a general-purpose register, `dup.16b` carries it back to the vector unit, and the masked words
+/// come out again — three register-file crossings, all in series on the chain that feeds the hash.
+///
+/// This builds the same mask without a scalar ever being involved. An inclusive prefix-OR across
+/// the compare result marks every lane at or after the first `;`, and `bic` keeps the rest:
+///
+/// ```text
+///   p  = cmeq(v, ';')
+///   p |= p << 1 lane      p |= p << 2      p |= p << 4      p |= p << 8
+///   masked = v & ~p
+/// ```
+///
+/// Four `ext`/`orr` pairs and a `bic`, which is five vector operations more than v21 spends and
+/// nine more than v19. What it buys is that `klo` and `khi` no longer depend on `len`. The two
+/// derivations become independent chains off the same `cmeq` — `shrn`/`fmov`/`ctz` for the length,
+/// `ext`-`orr`-`bic` for the key — where v21 has one chain twice as long with a round trip through
+/// the general-purpose file in the middle of it.
+///
+/// So this is the discriminator for v21's own explanation, and all three outcomes say something.
+/// Faster than v21: the serial crossings were the term, and the way to spend the idle vector unit
+/// is on work that never comes back. The same: they were not, and the loop is bound on something
+/// this project has not named. Slower: five extra vector operations a row cost more than the
+/// shortened chain saves, which would be the first evidence that the vector side has a ceiling
+/// too — and would date the "completely idle" claim v19 has been resting on.
+///
+/// Bit-identical to [`scan_flat_keyed`], hash included; `pfx_agrees_with_the_scalar_masking`
+/// holds it there.
+///
+/// Reads [`FLAT_SLACK`] bytes from `pos`, as [`scan_flat_keyed`] does.
+#[inline(always)]
+pub fn scan_flat_keyed_pfx(data: &[u8], pos: usize) -> Option<(usize, u64, u64, u64)> {
+    use std::arch::aarch64::{
+        vbicq_u8, vceqq_u8, vdupq_n_u8, vextq_u8, vget_lane_u64, vgetq_lane_u64, vld1q_u8,
+        vorrq_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vreinterpretq_u64_u8, vshrn_n_u16,
+    };
+
+    let w: &[u8; 16] = data[pos..pos + FLAT_SLACK].try_into().unwrap();
+
+    // SAFETY: `w` is sixteen readable bytes.
+    let (v, eq, nib) = unsafe {
+        let v = vld1q_u8(w.as_ptr());
+        let eq = vceqq_u8(v, vdupq_n_u8(b';'));
+        let nib = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(eq))), 0);
+        (v, eq, nib)
+    };
+
+    if nib == 0 {
+        return None;
+    }
+
+    let len = (nib.trailing_zeros() >> 2) as usize;
+
+    // SAFETY: register-to-register only. `vextq_u8(zero, p, 16 - k)` takes the top `k` bytes of
+    // the zero vector followed by the low `16 - k` of `p`, which is `p` shifted up by `k` lanes;
+    // four of those OR the compare forward into every higher lane.
+    let (klo, khi) = unsafe {
+        let z = vdupq_n_u8(0);
+        let p = vorrq_u8(eq, vextq_u8(z, eq, 15));
+        let p = vorrq_u8(p, vextq_u8(z, p, 14));
+        let p = vorrq_u8(p, vextq_u8(z, p, 12));
+        let p = vorrq_u8(p, vextq_u8(z, p, 8));
+        let k = vreinterpretq_u64_u8(vbicq_u8(v, p));
+        (vgetq_lane_u64(k, 0), vgetq_lane_u64(k, 1))
+    };
+
+    let short = len < 8;
+    let prev = if short { 0 } else { mix(0, klo) };
+    let last = if short { klo } else { khi };
+
+    Some((pos + len, mix(prev, last), klo, khi))
+}
+
 /// [`scan_flat_keyed`] taking the 16-byte window instead of a slice and an index, and
 /// returning the name's *length* rather than the absolute position of the `;`.
 ///
@@ -726,6 +802,43 @@ mod tests {
             check(&line(name));
         }
         check(&[b'x'; 64]);
+    }
+
+    /// [`scan_flat_keyed_pfx`] reaches the same two words a fourth way — an inclusive prefix-OR
+    /// across the compare, then `bic` — and the whole point of it is that no scalar is involved,
+    /// so the usual "does `trailing_zeros` see the same thing" argument does not cover it. What
+    /// has to hold instead is that the prefix-OR is *inclusive* and saturates: a `;` at lane 0
+    /// must zero all sixteen, a `;` at lane 15 must keep fifteen, and a second `;` later in the
+    /// window must change nothing. Every length across both seams covers all three.
+    #[test]
+    fn pfx_agrees_with_the_scalar_masking() {
+        let check = |d: &[u8]| {
+            assert_eq!(scan_flat_keyed_pfx(d, 0), scan_flat_keyed(d, 0), "{:?}", &d[..16]);
+        };
+
+        for len in 0..=100usize {
+            let name: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            check(&line(&name));
+        }
+        for (name, _) in STATIONS {
+            check(&line(name));
+        }
+        check(&[b'x'; 64]);
+    }
+
+    /// Two `;` inside one window is the case the prefix-OR could plausibly get wrong, since it
+    /// propagates every match forward rather than just the first.
+    #[test]
+    fn pfx_finds_the_first_semicolon_at_an_offset() {
+        let mut d = vec![b'q'; 8];
+        d.extend_from_slice(b"Abha;1.2\nSaint-Pierre;3.4\n");
+        d.resize(d.len() + 32, b'z');
+        assert_eq!(scan_flat_keyed_pfx(&d, 8), scan_flat_keyed(&d, 8));
+        assert_eq!(scan_flat_keyed_pfx(&d, 17), scan_flat_keyed(&d, 17));
+
+        let mut two = b"ab;cd;ef;gh;ij;k".to_vec();
+        two.resize(64, b'z');
+        assert_eq!(scan_flat_keyed_pfx(&two, 0), scan_flat_keyed(&two, 0));
     }
 
     #[test]
