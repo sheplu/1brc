@@ -1,0 +1,20 @@
+# Confirming v19, because one arm is not a result and this one is 10x its own prediction.
+#
+# The v20 batch put v19 at 360 ms against v12's 383/384 at 18 threads and 672 against 704/703 at
+# 8, on a floor of 1 ms. That is 23 and 32 ms from a change the instruction count said was worth
+# 1 to 2 — and in the same batch v20, which is 9.5 instructions a row *smaller* than v19, came
+# back 16 ms slower. Either the project's fastest version just appeared or v19's arm was a
+# fluke, and it had only one arm at each thread count.
+#
+# So: both binaries, twice, at both thread counts, nothing else in the batch. If v19's two arms
+# land together and below v12's two, the result stands and the cost model needs replacing again
+# — this time because the win tracks *which execution unit* the work is on, not how much of it
+# there is.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t18	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v12 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t18 (dup)	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t8	OBRC_THREADS=8 ./target/release/v19_vecscan measurements.txt >/dev/null
+v12 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t8 (dup)	OBRC_THREADS=8 ./target/release/v19_vecscan measurements.txt >/dev/null

@@ -1,0 +1,38 @@
+# v18_thrift against v12_pairs: is the throughput rate from v16 real, and is it linear downward?
+#
+# v16 added 36 instructions a row and cost 38 ms, which is the first rate this project has had:
+# about 1 ms per instruction-per-row at 18 threads. Everything before it was measured as a sign,
+# not a slope.
+#
+# v18 makes two changes that should test the slope from the other side. Both are pure arithmetic
+# removals on the branch that hangs off `len` and never feeds back, which is exactly what the old
+# latency model said could not matter: the magic-multiply digit combine (seven instructions to
+# four, two multiplies to one) and the key mask taken off `trailing_zeros` instead of off the
+# length derived from it (one `and` for `lsr`/`add`/`ubfiz` on the w1 side).
+#
+# The disassembly already says they do not come out as removals. Counted separately against v12's
+# 214-instruction pair loop:
+#
+#                        insns/row   ubfx/ubfiz   mul   mov/movk/orr   loads
+#   v12                      107.0            8     8             23      24
+#   + tz mask                108.0            6     8             24      24
+#   + magic multiply         114.5            2     6             36      26
+#
+# The arithmetic shrank as designed and the loop grew by 7.5 instructions a row, all of it
+# `mov`/`movk`/`orr` rebuilding constants that no longer fit. So the prediction here is +7 ms, not
+# -6, and what is really on trial is the rate: +7 means it is linear and the target has to move
+# from operations to live values; near zero means v16's 38 ms was its extra load rather than its
+# extra instructions.
+#
+# REPS=9 rather than 5 because a 7 ms effect sits close to the 5 ms floor the v16 batch measured.
+#
+# Each binary is entered twice under two labels. Those pairs are the batch's noise floor and
+# nothing smaller than their spread may be read as a result.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v18 t18	OBRC_THREADS=18 ./target/release/v18_thrift measurements.txt >/dev/null
+v12 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v18 t18 (dup)	OBRC_THREADS=18 ./target/release/v18_thrift measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v18 t8	OBRC_THREADS=8 ./target/release/v18_thrift measurements.txt >/dev/null
+v12 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v18 t8 (dup)	OBRC_THREADS=8 ./target/release/v18_thrift measurements.txt >/dev/null

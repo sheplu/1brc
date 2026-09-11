@@ -5,9 +5,11 @@ sorted. [The original challenge](https://github.com/gunnarmorling/1brc) is Java;
 port used as an optimization exercise, so every stage of the work is kept as its own binary and
 benchmarked against the ones before it.
 
-**76.6 s → 0.38 s**, a 207× ratio measured in one batch. No external crates: the syscalls are
-hand-written `extern "C"`, the threading is `std::thread`, and the only vector code is SWAR in
-plain `u64`.
+**76.6 s → 0.36 s.** No external crates: the syscalls are hand-written `extern "C"`, the threading
+is `std::thread`, and the hot loop is SWAR in plain `u64` apart from the delimiter search and the
+key mask, which are half a dozen NEON instructions. The 207× in the ratio is from a single batch
+that read 76.6 s and 370 ms; the 22 ms below that came later, across three batches of their own,
+because on this machine numbers from different batches are not comparable.
 
 ## Results
 
@@ -29,14 +31,42 @@ oracle's on the full dataset.
 | `v9_flatscan` | fixed-width branchless `;` scan | 873 ms | 490 ms |
 | `v10_rawhash` | hash indexed off high bits, no avalanche | 845 ms | 472 ms |
 | `v11_keyed` | the probe key falls out of the scan | **685 ms** | 398 ms |
-| **`v12_pairs`** | **2 interleaved line streams instead of 3** | 711 ms | **381 ms** |
+| `v12_pairs` | 2 interleaved line streams instead of 3 | 711 ms | 381 ms |
+| `v19_vecscan` | the two `;` masks come from one vector compare | 678 ms | 365 ms |
+| **`v21_vmask`** | **the key mask becomes a lane compare, so the `csel`s go** | **662 ms** | **359 ms** |
 | ~~`v13_hoist`~~ | ~~table header hoisted, bounds checks removed~~ | 724 ms | 393 ms |
+| ~~`v15_bounds`~~ | ~~v13's bounds checks only, no control-flow change~~ | 681 ms | 381 ms |
+| ~~`v16_newline`~~ | ~~next row taken from the `\n`, not from the value~~ | 716 ms | 413 ms |
+| ~~`v17_cursors`~~ | ~~v16 with the stream cursors kept out of memory~~ | 737 ms | 418 ms |
+| ~~`v18_thrift`~~ | ~~magic-multiply digits, key mask off `trailing_zeros`~~ | 675 ms | 383 ms |
+| ~~`v20_vecbounds`~~ | ~~v19 plus v15: the smallest loop, and slower than v19~~ | 702 ms | 376 ms |
 
-18 threads — every core — is the headline: **381 ms**. 8 threads is the ladder's comparison
-baseline, and there the fastest binary is v11, not v12; see below. (`v1_naive` is the one number
+18 threads — every core — is the headline: **359 ms**. 8 threads is the ladder's comparison
+baseline, and v21's 662 there is the first number that clears v11's 685 by more than a batch
+effect — though those two are still from different batches and this README does not compare
+across batches. What can be said is that v19's batch and the ladder's agree on v12 at 8 threads
+to the millisecond (711), which makes it worth a run rather than a claim. (`v1_naive` is the one number
 measured elsewhere, in a three-config batch that also held v12 at 370 ms and v9 at 474 ms. The
 207× ratio in the header is that batch's, so it is internally consistent even though it does not
 match this table to the millisecond.)
+
+`v15_bounds` is the one row measured in a batch of its own, where v12 read 668 ms and 369 ms; it is
+listed against those, not against the 711/381 above. The detail is under "Fewer instructions per
+row" below, with v13. v16 and v17 are likewise from their own batch (`scripts/v16-newline.tsv`),
+where v12 read 680 and 376 ms, and v18 from `scripts/v18-thrift.tsv`, where v12 read 672 and
+378 ms. v19 and v20 come from `scripts/v20-vecbounds.tsv` and `scripts/v19-confirm.tsv`, where v12
+read 704/703 and 383/384, then 711/708 and 384/387; against its own control v19 is **−24 ms at 18
+threads and −32 at 8**, not the −22/−33 mixed baselines would suggest. v21 is from
+`scripts/v21-vmask.tsv`, which read v12 at 708 and 390 — about 1.5% slow throughout — so v19's
+row above is that batch's 676/365 and v21 is **−14 ms at 8 threads and −8 at 18** against it.
+
+**Every number in this table is ~10-15 ms too high, including that one.** `batch.sh` times
+`subprocess.run(..., shell=True)`, so it charges each run a Python `fork`/`exec` and a `/bin/sh`
+that the program never asked for; `sh -c /usr/bin/true` costs 17 ms on this machine. Run from a
+prompt, v12 is **~360 ms**, and 356 of that is inside `main`. The offset is additive and applies
+to every row, so the ladder is still a fair comparison with itself and is left as measured — but
+no figure here should be quoted as an absolute cost. See `src/bin/null.rs`, which was written to
+bracket process startup and instead found that most of what it was bracketing was the harness.
 
 Every figure above comes from the v14 build: a 1 MiB read chunk and `-C target-feature=+cssc`.
 Both are described in their own section below; together they are worth about 60 ms of the 441 ms
@@ -46,6 +76,17 @@ why the smaller sweeps were all re-measured rather than carried forward.
 v13 is in the table because it is struck through. It removes 20 instructions per row and is 3%
 slower for it, in four separate batches now; it is kept in the tree as a counterexample and nothing
 ships it. See below.
+
+v19, v20 and v21 are the newest group and they are best read together. v19 does one thing — the
+two `;` masks come from a single `cmeq` against a splat, instead of `eor`/`sub`/`bic`/`and` twice —
+and it is worth 2.0 instructions a row and 24 ms. v20 is v19 with v15's range-check removal folded
+in; at 95.5 instructions a row against v12's 107.0 it was the smallest loop this project had ever
+compiled, and it is 16 ms *slower* than v19. v21 moves the key mask the same way v19 moved the
+compare, reaches 91.5, removes two and a half times as much integer work as v19 did — and returns
+8 ms, not the 20 to 55 that was predicted. The three together are what "The loop is bound on
+integer throughput" and "Integer operations are not a rate either" below are about. Between them
+they retire the register-pressure account that v13, v15 and v18 had built up, then retire
+instruction count as a target, then retire integer-operation count as a rate.
 
 The last three rows are not the same kind of result. v10 removes five serial operations from the
 hot loop and the *engine* gets 3–4% faster for it in every batch it has been measured in; the
@@ -95,25 +136,39 @@ that is real in both, is the size of the effect this README keeps warning about.
 
 ## Where the time actually goes
 
-Where v12 spends 381 ms at 18 threads, from its own `OBRC_PHASES` instrumentation (median of three
+Where v19 spends 359 ms at 18 threads, from its own `OBRC_PHASES` instrumentation (median of three
 runs; the workers' figures are per-thread means, and reading and parsing are strictly serialized
 within a thread so the two add):
 
-| phase | ms | |
-|---|---:|---|
-| outside `main` | 24 | exec, dyld, teardown, and the harness's own spawn |
-| workers — read | 46 | 13% of worker time |
-| workers — **parse** | **310** | **87%** |
-| merge + output | 0.6 | 413 stations, 18 tables |
-| straggler | 0.7 | spread between the first and last thread to finish |
+| phase | ms | | v12 |
+|---|---:|---|---:|
+| harness | 10-15 | `batch.sh`'s Python `fork` and `/bin/sh` — not the program | 10-15 |
+| outside `main` | 4 | exec, dyld, Rust runtime, teardown | 4 |
+| workers — read | 45 | 13% of worker time | 46 |
+| workers — **parse** | **295** | **87%** | **310** |
+| merge + output | 0.6 | 413 stations, 18 tables | 0.6 |
+| straggler | 0.5 | spread between the first and last thread to finish | 0.7 |
 
 Seven eighths of the run is the parse loop, and the sections below are mostly about failing to make
-it smaller. The read was 78 ms of 441 before the chunk size was fixed and is 46 ms of 381 now,
+it smaller. The read was 78 ms of 441 before the chunk size was fixed and is 45 ms of 340 now,
 which is most of why `parse`'s share went up while its absolute cost went down.
 
-The 24 ms outside `main` is the largest thing here nobody has moved. It is not debuginfo —
-`strip = true` was built and measured and is worth exactly nothing — so it is exec, dyld and
-teardown, and `std::process::exit(0)` already skips as much of the last of those as is safe.
+Every column but `parse` is the same to within its own run-to-run spread, which is what v19 should
+look like: one `cmeq` in the row, nothing touched outside it. The 24 ms it wins comes out of the
+parse row and only the parse row. v21 is the same again — run interleaved against v19, three times
+each, its `read` is identical and its `parse` is about 4 ms lower per thread.
+
+The first two rows used to be one row reading `outside main — 24 ms`, described here as "the
+largest thing here nobody has moved". Nobody had moved it because most of it was not there.
+`src/bin/null.rs` and `src/bin/spawn.rs` were written to split it three ways and the split came out
+lopsided: 18 threads with 2 MiB stacks apiece cost nothing measurable to create and join, `null`
+run through the harness costs the same 17 ms as `/usr/bin/true` run through the harness, and `null`
+run directly costs 0.6 ms more than `/usr/bin/true` run directly. Against v12 the three
+measurements are 370 ms via `sh -c`, 360 ms direct, and 356 ms from the top of `main`.
+
+So process startup is ~4 ms, of which about 0.6 is this binary rather than Unix, and it was never
+worth attacking. That also explains the old row's own hedge — `strip = true` was built, measured
+and found worth exactly nothing, which is what you would expect of a lever on 4 ms.
 
 Two ablation harnesses drove almost every decision here. Guessing was wrong more often than not —
 including about which *half* of a technique would be expensive; see the NEON bitmap below.
@@ -228,7 +283,7 @@ do. Same batch, 18 threads:
 | `keyed2` | 359 ms | 310 ms | **49 ms** |
 
 v12's own `OBRC_PHASES` says 46 ms independently, from a completely different instrument. So a
-*free* reader would be worth about 48 ms of 381, not 230 — the rest overlaps with compute, because
+*free* reader would be worth about 48 ms of 360, not 230 — the rest overlaps with compute, because
 a thread that is parsing is not queueing. Every copy-free design that was going to reclaim
 "230 ms" — `mlock`, dedicated toucher threads, a producer-consumer split — was competing against a
 phantom, and all of them are now retired on that basis rather than on their own measurements.
@@ -420,7 +475,7 @@ It has two costs, and they are why it is worth stating rather than just doing. r
 `cssc` an unstable feature name, so every compile warns. And unlike `target-cpu=native`, which
 degrades gracefully, this does not: on an M1 through M3 the binary will `SIGILL`. See Caveats.
 
-## Seven things that were predicted to work and did not
+## Eight things that were predicted to work and did not
 
 Recorded because the plans said they would, in writing, before the measurement.
 
@@ -435,6 +490,29 @@ batch:
 
 Flat from 2^13 up, and *worse* below it. Each extra probe is another dependent load, and a low load
 factor buys more probes than it saves page walks. The default is 2^14 for the memory, not the time.
+
+**The table's live set would not fit L1d.** The sweep above cannot answer this and neither can any
+other in this file, because moving the slot count leaves exactly 413 entries live. Scattered over
+2^14 slots those 413 land on ~408 distinct 128-byte lines, so the table holds ~52 KB of L1d
+resident while a 1 MiB chunk streams past it — against 64 KB of L1d on twelve of this machine's
+eighteen cores. The only knob that moves a live set is the data, so `OBRC_GEN_STATIONS` was added
+to the generator and 400M-row files built at 50, 100, 200 and 413 stations:
+
+| stations | 50 | 100 | 200 | 413 |
+|---|---:|---:|---:|---:|
+| 18 threads | 164 ms | 158 ms | 160 ms | 164 ms |
+| 8 threads | 280 ms | 270 ms | 274 ms | 282 ms |
+
+Fifty stations is ~6 KB of entries and trivially resident, an eightfold cut in footprint. It ties
+with 413 at both thread counts, against a noise floor the duplicate endpoint arms put at 0–2 ms.
+The experiment was biased toward finding an effect — fewer stations also means shorter probe chains
+and a more predictable `step_long` branch — and it came back flat anyway. Netting out process
+startup these files run 0.360 ns/row against the real dataset's 0.361, so the miniature is
+faithful. The 4–6 ms by which 100 and 200 beat both ends is above the noise but non-monotonic, and
+is neither name length (the ≥16-byte fraction is flat at 2.0–2.4%, and s100 is the *larger* file)
+nor bytes read; there is no lever in it. The files are not kept — 22 GB of them would evict the
+real dataset from the page cache — and `scripts/v15-footprint.tsv` carries the command to rebuild
+them in half a second each.
 
 **A 6% win that was not there.** An intermediate batch put v9 at 622 ms and v10 at 584 ms — 6.1% —
 and a thread sweep showed the gap widening monotonically from 0.1% at 6 threads to 6.1% at 18,
@@ -492,12 +570,26 @@ different instruments agree, and the plan was deleted unimplemented. That is the
 in the project and the only reason it was cheap is that the premise got measured before the code
 got written. The section above has the numbers.
 
-**Fewer instructions per row.** v13, above. Four results now say the parse loop is not bound by
+**Fewer instructions per row.** v13, above. Six results now say the parse loop is not bound by
 anything the source can address: v12's stream sweep says it is not latency past two streams (a
 third is worse at 18 threads and a fourth at 8), the NEON bitmap says it is not byte scanning (both
 delimiter masks cost 10 ms over `touch` and the design still lost), pairing the accumulate says it
-is not store ports (half the memory operations, 1.5%), and v13 says it is not instruction count
-either — 20 fewer per row, 3% slower.
+is not store ports (half the memory operations, 1.5%), v13 says it is not instruction count
+either — 20 fewer per row, 3% slower — v15 says the same thing again with the confound removed,
+and the station sweep says it is not the table's cache footprint.
+
+> **The instruction-count clause did not survive v16 and v18.** Adding 36 instructions a row cost
+> 38 ms; adding 7.5 cost 4.5. That is a rate, not a null result, and it retrospectively means v13
+> and v15 were each earning a throughput credit that their control-flow and rematerialisation costs
+> then overspent. The rest of the paragraph stands; "not instruction count" does not. See "That
+> model was wrong" and "The loop will not accept a removal" below.
+>
+> **And the byte-scanning clause did not survive v19.** The NEON bitmap lost, but it lost as a
+> *design* — a 64-byte block, a bitmap, and a separate drain loop that cost +194 ms. Doing the same
+> compare in place, inside the row, is worth 24 ms, which makes byte scanning the single largest
+> thing the source could address after all. What the bitmap actually measured is that draining bits
+> is expensive and that forfeiting v11's masked key is expensive, neither of which is a statement
+> about `cmeq`. See "The loop is bound on integer throughput" below.
 
 `+cssc` is the apparent exception and is worth holding next to this one, because it removes
 instructions and *does* pay. The difference is which instructions, and the distinction is sharper
@@ -531,6 +623,346 @@ loop-carried value has to be materialized at each one. v13's preamble spills reg
 needed to. **An instruction count is not a cost model**: it does not price live ranges, and on a
 core this wide a never-taken fused compare-and-branch is nearly free while a constraint on the
 allocator is not.
+
+**v15 tests that explanation and it does not survive intact.** If the loop exits were what cost
+v13 its 15 ms, then removing v13's *other* half by itself — the three bounds-checked loads, with
+no new exit anywhere — should win back what the exits lost. `src/bin/v15_bounds.rs` does exactly
+that, fetching the 16-byte name window and 8-byte value window through a raw pointer behind a
+`debug_assert` on the buffer slack the worker already guarantees. The safe spelling was tried
+first and does not fold: slicing each stream to `&buf[..end + TAIL_GUARD]` and looping on
+`pos + TAIL_GUARD < lane.len()` is the same claim written for LLVM to verify, and LLVM will not
+carry the implication across the loop's back edge and a PHI — 212 instructions against v12's 214,
+with all 17 `cmp`, 9 `b.hi` and 4 `cmn` still standing.
+
+The raw-pointer version does fold, to 203 instructions per pair against 214. It is slower:
+
+| | v12 | v15 | duplicate-arm spread |
+|---|---:|---:|---:|
+| 18 threads | 369 / 375 ms | 381 / 382 ms | 6 ms |
+| 8 threads | 668 / 668 ms | 681 / 682 ms | <1 ms |
+
+Same sign as v13 and most of the same size, from a change with no control flow in it at all. So the
+loop-exit story above is at best a second-order effect. Diffing the two disassemblies says what the
+first-order one is, and it is one register.
+
+The parser finds the decimal point with `!word & 0x10101000`, and that `ctz` is on the loop-carried
+chain — it is what produces the next row's start. In v12 the mask lives in `x20` for the whole loop:
+
+```
+v12   ldr x8, [x22, x8]  |  bic x13, x20, x8                    |  ctz x13, x13
+v15   mov w12, #0x1000 ; movk w12, #0x1010, lsl #16  |  bic x12, x12, x8  |  ctz x12, x12
+```
+
+v15 has the space and does not use it: freeing the checks let the allocator drop `0x10101000`, and
+it now rebuilds the constant with a two-instruction serial `mov`/`movk` sitting immediately in
+front of a recurrence node, twice per pair. v12 rebuilds it too — but at `0x117c`, the last
+instruction before the back edge, for the *next* iteration, where it is off the chain. The other
+19 instructions that came back are the same story: `movk` 3 → 10, `mov` 11 → 16, the hash seed
+rebuilt with four `mov`/`movk` inside the loop, `SEMI` with a `mov`/`orr` pair.
+
+**It is not that the loop has run out of registers.** It touches 26 GPRs of the 29 usable — `x30`
+included, holding the constant 28 — but `x25`, `x27` and `x28` are free, there is not one spill
+store in the body, and all 32 NEON registers are untouched. The eight stack accesses per pair are
+loads of the table header, not spill traffic. Rematerialisation here is LLVM choosing a cheap
+option, not being forced into an expensive one; it just chose it in the wrong place.
+
+What this actually gives the project is a cost model, and it is narrower than "instruction count
+does not matter". Every result in this section fits it:
+
+- N=1 is 22% worse than N=2, so at one stream the row-to-row recurrence is exposed.
+- N=3 and beyond are worse than N=2, so by two streams it is covered and the extra streams only
+  compete for registers.
+- At N=2 the loop sits at the crossover, with the recurrence nearly binding and almost no slack.
+- So `+cssc` wins 15 ms by taking two cycles off the recurrence's two `trailing_zeros`, v15 loses
+  by putting two instructions back onto it, and v13 loses by doing both at once. The magic-multiply
+  digit combine, `keep` straight off `trailing_zeros`, the weaker hash and the paired accumulate
+  are all on the branch that hangs off `len` and never feeds back — which is why the one of them
+  that was measured moved 1.5%.
+
+The recurrence is `pos → load 8B → semi mask → ctz → len → semi → load 8B at semi+1 → dot mask →
+ctz → next pos`. Two dependent L1 loads and two `ctz`, and `+cssc` has already taken what there is
+to take from the second pair. **The only untried item on it is the second load** — whose address
+cannot be computed until the first load's `ctz` resolves.
+
+### That model was wrong, and v16 and v17 are what killed it
+
+The model above says the pair loop is latency-bound at N=2, so the second dependent load is the
+thing to attack. Two versions attacked it, and both made the program slower — the second one by
+doing the model's own bidding.
+
+`src/bin/v16_newline.rs` takes the next row's start from the `\n` rather than from the value. The
+newline is reachable from `pos` alone, so a 24-byte window issues all its loads at once and the
+recurrence collapses from two `ctz` with a dependent load between them to one `ctz` with none. The
+work that remains — the `;`, the hash, the value, the table — still happens, but nothing later reads
+it, so it hangs off the loop instead of queueing in it. The disassembly confirms the shape: `add x8,
+x22, x3` / `ldp x9, x10, [x8]` / `ldr x8, [x8, #0x10]`, three loads back to back, no branch between
+them and the answer.
+
+`src/bin/v17_cursors.rs` is the control. At v16's body size LLVM stopped keeping the two stream
+cursors in registers: it tail-merged the pair loop with the two drain loops and reached the streams
+through a rotating pointer, so every row's `pos` took a store-to-load round trip. v12 has the
+identical source shape and keeps both cursors in `x23` and `x24`. Naming the four values kills the
+array, and the frame stores in the pair loop go to zero. That removes four to six more cycles from
+the loop-carried chain — precisely, and only, what the model says to do.
+
+`scripts/v16-newline.tsv`, REPS=5, each binary entered twice under two labels:
+
+| | v12 | v16 | v17 | duplicate-arm spread |
+|---|---:|---:|---:|---:|
+| 18 threads | **376 / 376 ms** | 413 / 415 ms | 418 / 419 ms | 1–5 ms |
+| 8 threads | **680 / 679 ms** | 716 / 720 ms | 737 / 740 ms | 1–5 ms |
+
+That is the tightest floor this project has measured — the paired-accumulate batch had a 32 ms
+spread around a 6 ms effect, this one has 5 around 40 — so there is no reading of it as noise.
+Shortening the recurrence costs 38 ms. Shortening it further costs 42.
+
+**A change that removes recurrence latency and loses cannot be explained by a latency-bound loop.**
+v17 is the one that settles it, because unlike v16 it adds nothing: same instructions, same loads,
+same live values, one fewer memory round trip on the carried value. It is 5 ms slower at 18 threads
+and 20 ms slower at 8. The direction of that scaling is the second tell — at 8 threads the work sits
+on the six wide cores with the two narrow clusters idle, so the configuration with *more* slack to
+absorb latency is hurt *more* by trading memory for registers. Latency pressure does not behave that
+way. Register pressure and issue pressure do.
+
+So the pair loop is throughput-bound, and the ordering the old model explained needs a different
+explanation. It has one, and it is the plainer of the two: N=1 is 22% worse because one stream
+leaves the machine idle waiting on the chain, N≥3 is worse because the streams compete for
+registers, and at N=2 the chain is already covered — covered *well enough that further shortening
+it is worth nothing*, which is what the old model got wrong by reading "at the crossover" into
+"nearly binding".
+
+v16's cost side then sets a rate the project did not previously have. The hot pair loop goes 107 →
+143 instructions a row and 38 ms with it: **about 1 ms per instruction-per-row at 18 threads.**
+Applied backwards, that is the missing term in the two results this section was written to explain.
+v13 removed ~20 instructions a row and should have won ~20 ms; it lost 12, so its control-flow
+changes cost ~32. v15 removed ~5.5 a row and should have won ~6; it lost 9–14, so its
+rematerialisation onto the chain cost ~15–20. Both still lose, for the reasons given above — but
+they lose *against a throughput credit they were also earning*, which is a different accounting from
+the one printed above them, and it means the instruction count was never the part that failed.
+
+One suspect for which throughput, untested: v16 adds a fourth 8-byte load to a body that had three.
++33% on the load/store ports predicts a 38 ms slowdown far better than +34% on total instructions
+does, and it is the only reading that also explains why `+cssc` — one instruction fewer, no change
+in loads — is the single instruction-count change in this project that ever paid. The paired
+accumulate is weak evidence the other way (halving the store traffic of the one operation every row
+performs bought 1.5%), but stores and loads are not the same port.
+
+What follows for the next version is that the target moves off the recurrence, and that the rate
+makes small removals worth measuring again for the first time since v13.
+
+### The loop will not accept a removal
+
+v18 is that test, and it fails in a way that is more useful than the change it was testing.
+
+Two pure arithmetic removals, both on the branch that hangs off `len` and never feeds back, both
+sitting unused in the source since v5 because the old model said that branch could not matter.
+`parse_temp_branchless_mul` folds the three digits into one multiply — royvanrijn's own combine,
+which this project has been carrying in expanded form — turning seven instructions and two chained
+`umaddl` into four instructions and one `mul`. `scan_flat_keyed_tz` builds the key mask from the
+`;`'s bit position rather than from the length derived from it, because `8 * (len & 7)` is
+`tz & 0x38`; LLVM already folds this on the w0 side and the `+ 8` hides it on the w1 side. Neither
+adds a branch, a load or a live value. Six instructions a row, for nothing.
+
+Counted in the disassembly before the batch ran:
+
+| | insns/row | `ubfx`/`ubfiz` | `mul` | `mov`/`movk`/`orr` | loads |
+|---|---:|---:|---:|---:|---:|
+| v12 | 107.0 | 8 | 8 | 23 | 24 |
+| + tz mask | 108.0 | 6 | 8 | 24 | 24 |
+| + magic multiply | 114.5 | 2 | 6 | 36 | 26 |
+
+The arithmetic shrank exactly as designed and **the loop got bigger by 7.5 instructions a row**.
+All of it, and more, comes back as `mov`/`movk`/`orr`: 23 → 36. The multiply's two constants,
+`0x0000000F000F0F00` and `0x640A0001`, do not fit, and the allocator pays for them by rebuilding
+others inside the body.
+
+`scripts/v18-thrift.tsv`, REPS=9, duplicate arms 0–1 ms apart:
+
+| | v12 | v18 |
+|---|---:|---:|
+| 18 threads | **378 / 378 ms** | 383 / 382 ms |
+| 8 threads | **672 / 673 ms** | 675 / 675 ms |
+
++4.5 ms, against a predicted +7. So the rate is confirmed from both directions and is roughly
+linear — 36 instructions for 38 ms, 7.5 for 4.5, call it **0.6–1.0 ms per instruction-per-row at
+18 threads**, sublinear at the small end — and v18 is a loss for exactly the reason the static
+count said it would be.
+
+**Three versions have now been converted into rematerialisation.** v13 removed instructions and got
+control flow back. v15 removed 28 check instructions a pair and got 19 back as rebuilt constants.
+v18 removes 6 a row and gets 13 back. The pattern is not that instruction count fails to matter —
+it does, at a measured rate — but that *the source cannot lower it*. The loop touches 26 of the 29
+usable GPRs and behaves like a fixed point: hand it a register and it spends one. v16 is the same
+observation from the other side, and the reason it is not symmetric — additions stick, because
+nothing has to make room for them.
+
+That retires a whole category of idea, including most of what was left on the list: the packed
+`min`/`max` load, cheaper `keep`, a leaner hash. It also re-reads v13 more cleanly than the
+control-flow story did. Hoisting the table header out of the frame does not remove work, it moves
+four values from memory into registers — into a loop with none to spare. Under this reading v13
+lost because it *added* live values, which is also why v17's spill fix lost, and it is a reason not
+to retry the hoist in the form the plan proposed.
+
+**The next thing to try is one fewer live value, not one fewer instruction.** The register-resident
+loop invariants are `SEMI`, `-LOW`, the hash seed, `0x10101000` and `#28`. None of them is an ARM64
+logical immediate, which is the only reason they occupy registers at all — `HIGH` is
+`0x8080808080808080`, is encodable, and costs nothing. All five are splat constants, and all 32 NEON
+registers are untouched. `parse_temp_branchless_mul` and `scan_flat_keyed_tz` stay in the library
+with their differential tests, because the arithmetic is correct and strictly better and the only
+thing wrong with it is where the constants have to live; on a build with slack in this loop they are
+the first things to re-try.
+
+> That paragraph is what led to v19, and it turned out to be right for the wrong reason. Moving
+> `SEMI` into a vector register is worth 24 ms — but not because a general-purpose register came
+> free. The section below has it.
+
+### The loop is bound on integer throughput, not instruction throughput
+
+v19 does one thing. `semi_mask` is `word ^ SEMI`, `x - LOW`, `& !x`, `& HIGH` — four integer
+operations, run twice a row for the two halves of the 16-byte window. `scan_flat_keyed_neon`
+replaces all eight with one `cmeq` against a splat `;` and two extracts. Same window, same two
+words feeding the hash and the key, same select, same downstream arithmetic; the compare yields
+`0xFF` per matching byte where the SWAR form yields `0x80`, and every consumer reads those masks
+through `trailing_zeros`, which cannot tell the difference. No new branch, no new live value, no
+change to the recurrence, no change to the row loop.
+
+The static count made it a non-event. `SEMI` and `LOW` do leave the general-purpose file — v12's
+`mov x2, #0x3838383838383838` / `orr` and `mov x16, #-0x101010101010102` / `movk` are gone,
+replaced by a `movi.16b v1, #0x3b` that costs one instruction and no register — but LLVM spends the
+room at once: `#28` comes out of `x30` and gets rebuilt twice a pair, and the `ldp` that fetched
+both words splits into two `ldr` now that the vector load shares the addressing. **Net −2.0
+instructions a row**, worth 1 to 2 ms at v18's rate. It went into the batch as an attribution
+control, not as a candidate.
+
+| `scripts/v20-vecbounds.tsv`, REPS=7 | v12 | v15 | v19 | v20 |
+|---|---:|---:|---:|---:|
+| 18 threads | 383 / 384 ms | 387 ms | **360 ms** | 376 / 377 ms |
+| 8 threads | 704 / 703 ms | — | **672 ms** | 702 / 702 ms |
+
+| `scripts/v19-confirm.tsv`, REPS=9 | v12 | v19 |
+|---|---:|---:|
+| 18 threads | 384 / 387 ms | **363 / 359 ms** |
+| 8 threads | 711 / 708 ms | **678 / 678 ms** |
+
+**−24 ms and −32 ms, reproduced across two batches on duplicate spreads of 0–4 ms.** It is the
+largest single win since v11 and it is 10 to 20 times what the instruction count predicted.
+
+Every rate this project has was measured on changes that kept the work on the same execution
+units: v16 added 36 integer instructions a row and cost 38 ms, v18 added 7.5 and cost 4.5, v15
+removed integer instructions and lost because the allocator rebuilt constants with them. Fit
+against those, v19's −2.0 is worth about 1.5 ms. It returned 23. Strip loads, stores, branches and
+vector work out of the counts and a different column lines up:
+
+| | insns/row | integer ops/row | measured vs v12 |
+|---|---:|---:|---:|
+| v12 | 107.0 | 79.5 | — |
+| v15 | 101.5 | 80.5 | +4 ms |
+| v19 | 105.0 | 73.0 | −23 ms |
+| v20 | 95.5 | 70.5 | −7 ms |
+
+The eight `eor`/`sub`/`bic`/`and` a row were never eight instructions' worth of cost. They were
+eight *integer ALU slots* on a loop that has none spare, and a `cmeq` on a completely idle vector
+unit does the same work beside it rather than in front of it. At ~107 instructions and ~22 cycles
+a row this loop runs near 5 IPC; on the twelve narrow cores that is most of the issue width, and
+essentially all of it is integer.
+
+**v20 is the other half, and it is the one that makes the claim specific.** It is v19 with v15's
+range-check removal folded in, and the composition works exactly as designed in the disassembly:
+apart the two changes are worth −5.5 and −2.0 instructions a row, together −11.5, because `SEMI`
+and `LOW` stop being rebuilt at all and v15's eight rematerialisation instructions a pair for them
+are simply absent. At 95.5 instructions a row it is the smallest loop this project has compiled,
+the only one under 100 — and it is 16 ms slower than v19, and at 8 threads it hands back the
+entire win, 702 against v12's 704.
+
+So the range checks are not overhead, and that now has two measurements in two register regimes:
+v15 removed them and lost 9.5 ms under maximum constant pressure, v20 removed them and lost 16 ms
+with `SEMI` and `LOW` out of the file entirely. The second is the cleaner one, because v19 is its
+only control — one call differs — and every rematerialisation v15's loss was blamed on is gone
+from it. `cmn`/`cmp`/`b.hi` are the loop's cheapest and most predictable slots, the code that
+replaces them still computes the same addresses, and the freed room goes straight into rebuilding
+`SEED` four instructions a row: the integer column only falls 73.0 → 70.5 while the instruction
+count falls by 9.5.
+
+**What this retires.** "Fewer instructions per row" as a goal, in both directions — v18 established
+that adding them costs and v20 establishes that removing them need not pay. Stage 2 of the plan
+this project has been working from, "make the bounds checks provably dead", is closed by v20 rather
+than by v15: it removes them without adding control flow, which was the whole hypothesis, and loses
+anyway. The register-pressure fixed point from v13/v15/v18 is real and still visible in every
+disassembly here; it was never the largest term.
+
+**What it opens.** The question is no longer how much the row does but which unit does it. The
+remaining integer work worth pricing that way: the key mask and the `keep` shift are byte-lane
+selects; the parser's dot search (`!word & 0x10101000`, then `trailing_zeros`, then a variable
+shift) is a byte-compare against `.` wearing SWAR clothes; `SEED` is rebuilt with four `mov`/`movk`
+a row in some versions and could be held in a vector register and pulled out with one `fmov`. What
+is *not* available is the hash multiply itself — NEON has no 64-bit integer multiply — so the
+mixing stays where it is.
+
+### Integer operations are not a rate either — v21 and the cost of a crossing
+
+v21 takes the first item on that list. `keep = (1 << (tz & 0x38)) - 1` and `w & keep` are a
+byte-lane select written in scalar arithmetic: keep the bytes before the `;`, drop the rest. NEON
+does that with one `cmhi` against a constant `[0, 1, .. 15]` and one `and.16b` — and because the
+lane mask covers all sixteen bytes at once, `klo` and `khi` fall straight out of it, so the two
+`csel` that chose which word had been masked are not replaced but *removed*. Whichever half the
+`;` is in, the other is already right: kept whole below it, zeroed whole above it. The delimiter
+index comes off one `shrn` extract (a nibble per input byte, so `trailing_zeros() >> 2` is the
+length) instead of two extracts, an `orr`, a `cbz` and a `csel`. The hash is untouched and
+bit-identical; nothing downstream of the scan changes at all.
+
+| | insns/row | integer ops/row | vector+xfer/row |
+|---|---:|---:|---:|
+| v12 | 107.0 | 79.5 | 0 |
+| v19 | 105.0 | 73.0 | 3.0 |
+| v20 | 95.5 | 70.5 | 3.0 |
+| **v21** | **91.5** | **56.5** | 9.0 |
+
+91.5 is the smallest this loop has ever compiled to, and −16.5 integer operations a row is two and
+a half times v19's −6.5. Straight-lining v19's own rate gives −58 ms; the batch header refused to
+write that down and predicted a wide **−20 to −55**.
+
+| `scripts/v21-vmask.tsv`, REPS=7 | v12 | v19 | v21 |
+|---|---:|---:|---:|
+| 18 threads | 390 ms | 369 / 365 ms | **358 / 360 ms** |
+| 8 threads | 708 ms | 676 ms | **662 ms** |
+
+**−8 ms at 18 threads and −14 at 8**, on duplicate spreads of 4 and 2 ms. Real, and the project's
+fastest version — but a third to a seventh of a prediction that was already hedged wide. So the
+integer column is not a rate either, and that is now the third cost model this loop has broken:
+
+| | integer ops removed | crossings added | measured |
+|---|---:|---:|---:|
+| v19 | 6.5 | 0 | **−23 ms** |
+| v21 | 16.5 | 2 | **−8 ms** |
+
+A *crossing* is a register-file transfer that did not exist before. v19 added none: the `cmeq` ran
+on bytes already sitting in a vector register, and the two extracts it needed produced values the
+row wanted in general-purpose registers anyway. v21 has to send a scalar back the other way —
+`ctz` computes `len` in a GPR, `dup.16b` returns it to the vector unit to build the lane mask, and
+the masked words come out again. Transfers per row go 1.0 → 3.0, and they are in series:
+
+```text
+  v19   ldr q → cmeq → umov → ctz → lsl → sub → and → hash
+  v21   ldr q → cmeq → shrn → fmov → ctz → dup → cmhi → and.16b → fmov → hash
+```
+
+Four of the added links are register-file crossings at roughly four cycles apiece. v21 bought
+sixteen integer ALU slots by inserting something like a fifteen-cycle detour on the chain those
+slots were sitting on, and came out ahead — barely. The unit of account is therefore neither
+instructions (which v20 retired) nor integer operations (which this retires) but **integer
+operations removed at no additional crossing.** v19 is the only change so far that managed it,
+which is why it is still the largest single win.
+
+That is a testable account rather than a story, because the detour is avoidable. A prefix-OR
+across the `cmeq` result — four `ext`/`orr` pairs, then one `bic` — marks every lane at or after
+the first `;` with no scalar ever involved, so `klo` and `khi` stop depending on `len`, the two
+chains run in parallel, and the crossing count goes back to v19's. If crossings are the term, that
+should recover a real part of the missing prediction. If it lands at −8 again, they are not, and
+this loop is bound on something nobody here has named yet.
+
+Also still open on the original list: v18's magic multiply was rejected because its two constants
+did not fit, and v21's register file is the emptiest one this project has produced — three of the
+five pinned constants are now in vector registers or gone.
 
 Ablations, warm reader at 18 threads, from a batch of their own where the spreads were tight
 (`keyed2` 333–351, `hot2` 349–357):
@@ -575,10 +1007,10 @@ and it is a low ceiling.
 **More threads than cores, and stripping the binary.** Two free knobs, swept together, both zero.
 Thread counts of 20, 24, 28 and 36 against the default 18 came in at 439, 443, 442 and 446 ms
 against 441 — flat, no trend, the best of them inside a millisecond of the default.
-Oversubscription can only pay if workers stall, and the read is 46 ms of 381 and stalls nobody.
+Oversubscription can only pay if workers stall, and the read is 46 ms of 360 and stalls nobody.
 `strip = true` in place of `debug = 1` measured 441 against 441; it cannot change codegen, and the
-hope was that it would shorten exec and dyld, which is 24 ms of the run. It does not measurably.
-Both knobs are left where they were.
+hope was that it would shorten exec and dyld. That it did not is no longer a puzzle: exec and dyld
+are 4 ms, not the 24 this section used to claim. Both knobs are left where they were.
 
 ## Correctness
 
@@ -654,6 +1086,14 @@ scripts/batch.sh scripts/v14-streams.tsv                 # the stream sweep, bot
 scripts/batch.sh scripts/v14-stage1.tsv                  # the coarse chunk sweep
 scripts/batch.sh scripts/v14-chunk.tsv                   # the finer one, around the optimum
 scripts/batch.sh scripts/neon.tsv                        # the rejected NEON bitmap
+scripts/batch.sh scripts/v15-bounds.tsv                  # v15, and the process-startup bracket
+scripts/batch.sh scripts/v15-footprint.tsv               # station count vs the table's live set
+scripts/batch.sh scripts/v16-newline.tsv                 # v16 and v17: the loop is not latency-bound
+scripts/batch.sh scripts/v18-thrift.tsv                  # v18: the same rate, measured downward
+scripts/batch.sh scripts/v20-vecbounds.tsv               # v19 and v20: it is the integer ports
+scripts/batch.sh scripts/v19-confirm.tsv                 # v19 again, because 24 ms needed it
+scripts/batch.sh scripts/v21-vmask.tsv                   # v21: and integer ops are not a rate
+scripts/loopcount.py target/release/v21_vmask            # the hot loop, counted by category
 ```
 
 `scripts/batch.sh` is the only sanctioned way to compare two numbers here: it refuses to start on
@@ -671,11 +1111,16 @@ The generator is deterministic and parallel: 1,000 chunks of 1M rows, chunk `i` 
 [-99.9, 99.9], which the Java original does not — across 1e9 gaussian samples at σ=10 a stray
 `-100.2` is not unlikely, and it would silently corrupt any parser assuming two integer digits.
 
+`scripts/v15-footprint.tsv` needs its four files built first; the header carries the loop. Note
+that `batch.sh` primes only `$DATA`, so a multi-file batch wants the others `cat`-ed by hand.
+
 `OBRC_THREADS` sets the worker count everywhere (default 8; 18 is the headline). `OBRC_TABLE_BITS`
 sets slots per table as a power of two (default 14). `OBRC_CHUNK` tunes the read size in v8 onward;
 the default is 1 MiB and the sweep behind that is in the v14 section above. `OBRC_PHASES` prints
 the phase breakdown, and `OBRC_READER` picks how `hot_floor` gets its bytes (`pread`, `mmap`,
-`mmap_warm`).
+`mmap_warm`). `OBRC_GEN_STATIONS` makes `generate` use a stride-sampled subset of the 413 names,
+which is the only way to vary how many table entries a run keeps live; unset, the output is
+byte-identical to what it always was.
 
 ## Caveats
 

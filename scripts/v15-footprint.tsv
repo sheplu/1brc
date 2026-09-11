@@ -1,0 +1,46 @@
+# Does the table's live-set footprint bound the loop?
+#
+# v15 killed the instruction-count thesis: 11 fewer instructions per pair, 9-14 ms slower.
+# The plan's stated fallback is the other candidate, and it is the one axis no sweep here has
+# ever varied. 413 live entries scattered over 16384 slots land on ~408 distinct 128-byte
+# lines, so the table holds ~52 KB of L1d resident while a 1 MiB chunk streams through it.
+# Twelve of this machine's eighteen cores have 64 KB of L1d. The table-bits sweep could not
+# see this: moving the slot count from 2^13 to 2^16 still leaves exactly 413 entries live.
+#
+# The only knob that moves the live set is the data, so: 400M rows at 50, 100, 200 and 413
+# stations (`OBRC_GEN_STATIONS`, stride-sampled so name lengths stay representative). 50
+# stations is ~6 KB of entries and unambiguously resident; 413 is the real workload.
+#
+# If the footprint is the bound, ns/row falls as the station count falls, and it falls harder
+# at t18 than t8 because t18 is the arrangement that puts work on the narrow cores. If ns/row
+# is flat, the table is not the bound, this direction dies here, and what is left is the
+# 46 ms read and the 18-21 ms loader.
+#
+# Confound to discount: equal rows, unequal bytes. The subsamples differ in mean name length,
+# so the files are 5.405 / 5.498 / 5.439 / 5.518 GB for 50 / 100 / 200 / 413. s50 is 2.0%
+# smaller than s413. Read is ~12% of the budget, so that is worth ~0.25% of wall clock —
+# a tenth of the smallest effect worth acting on.
+#
+# Endpoints are entered twice. Those pairs are the noise floor.
+#
+# The files are not kept — 22 GB of them would sit in the page cache that the real dataset
+# needs. Half a second each to rebuild:
+#
+#   mkdir -p /tmp/obrc-footprint
+#   for n in 50 100 200 413; do
+#       OBRC_GEN_STATIONS=$n ./target/release/generate 400000000 /tmp/obrc-footprint/s$n.txt
+#   done
+#
+# Result: flat. See the doc comment on src/bin/generate.rs.
+s50  t18	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s50.txt >/dev/null
+s100 t18	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s100.txt >/dev/null
+s200 t18	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s200.txt >/dev/null
+s413 t18	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s413.txt >/dev/null
+s50  t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s50.txt >/dev/null
+s413 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs /tmp/obrc-footprint/s413.txt >/dev/null
+s50  t8	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s50.txt >/dev/null
+s100 t8	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s100.txt >/dev/null
+s200 t8	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s200.txt >/dev/null
+s413 t8	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s413.txt >/dev/null
+s50  t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s50.txt >/dev/null
+s413 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs /tmp/obrc-footprint/s413.txt >/dev/null
