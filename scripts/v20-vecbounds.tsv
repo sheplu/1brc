@@ -1,0 +1,50 @@
+# v19 and v20 against v12 and v15: does removing a live value change what a removal costs?
+#
+# v18 left the project with a model rather than a target. The pair loop is throughput-bound at
+# roughly 0.6-1.0 ms per instruction-per-row at 18 threads, and it sits at a register-pressure
+# fixed point: three versions in a row (v13, v15, v18) removed instructions at the source level
+# and got them back as rematerialised constants, while v16's additions stuck. The conclusion was
+# that the next thing to try is not a cheaper computation but one fewer live value.
+#
+# v19 does exactly that and nothing else: the two delimiter masks come from one `cmeq` against a
+# splat `;` instead of `eor`/`sub`/`bic`/`and` twice, which returns SEMI to a vector register
+# (`movi.16b`) and deletes LOW. This is not the rejected NEON bitmap — no block, no drain loop,
+# same 16-byte window, same row loop, and the masked key still falls out of the scan.
+#
+# v20 is v19 plus v15. v15 alone is a *measured loss* of 9.5 ms: it removed 28 range-check
+# instructions a pair and the allocator put 19 back, rebuilding SEED with four mov/movk and SEMI
+# with a mov/orr pair. Half that failure is a GPR holding 0x3B3B..., and v19 does not have one.
+#
+# Counted before the batch, as of v18's lesson:
+#
+#                 insns/row   const-build/pair   bounds   loads
+#   v12               107.0                 15      3.5    12.0
+#   v15               101.5                 30      1.0    11.0
+#   v19               105.0                 16      4.0    14.0
+#   v20                95.5                 22      1.0    12.0
+#
+# The two changes are superadditive: -5.5 and -2.0 apart, -11.5 together, because SEMI and -LOW
+# stop being rebuilt at all. So the predictions are separable. v19 alone: -1 to -2 ms, under the
+# floor, and it is here as the attribution arm rather than as a candidate. v20: -7 to -11 ms.
+# v15 is re-entered because its 9.5 ms loss was measured in a different batch and the whole
+# argument rests on the difference between it and v20.
+#
+# If v20 lands near v12 the fixed-point model is wrong or incomplete, and the fact that this loop
+# is 11.5 instructions a row smaller with the same output would need a different explanation.
+#
+# REPS=7. The effect is larger than v18's but the arm count is up, so this stays above the floor
+# without doubling the batch.
+#
+# Each binary is entered twice under two labels. Those pairs are the batch's noise floor and
+# nothing smaller than their spread may be read as a result.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v15 t18	OBRC_THREADS=18 ./target/release/v15_bounds measurements.txt >/dev/null
+v19 t18	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v20 t18	OBRC_THREADS=18 ./target/release/v20_vecbounds measurements.txt >/dev/null
+v12 t18 (dup)	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v20 t18 (dup)	OBRC_THREADS=18 ./target/release/v20_vecbounds measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t8	OBRC_THREADS=8 ./target/release/v19_vecscan measurements.txt >/dev/null
+v20 t8	OBRC_THREADS=8 ./target/release/v20_vecbounds measurements.txt >/dev/null
+v12 t8 (dup)	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v20 t8 (dup)	OBRC_THREADS=8 ./target/release/v20_vecbounds measurements.txt >/dev/null

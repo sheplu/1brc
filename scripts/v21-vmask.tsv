@@ -1,0 +1,45 @@
+# v21 against v19: does the integer-throughput result scale, or was v19 a one-off?
+#
+# v19 moved the `;` compare to the vector unit and won 23 ms at 18 threads against an
+# instruction-count prediction of 1.5. v20 is its control — 9.5 instructions a row *smaller* and
+# 16 ms slower. The model that fits both is that this loop is bound on integer ALU throughput
+# specifically, and that the vector unit beside it is idle.
+#
+# That model has one calibration point and it is v19's own arm. This batch is the test of whether
+# it is a rate or a coincidence.
+#
+# v21 moves the rest of the scan's byte-lane work the same way: `keep = (1 << (tz & 0x38)) - 1`
+# and `w & keep` become a `cmhi` against `[0, 1, .. 15]` and one `and.16b`, which also makes both
+# `csel` for klo/khi unnecessary, and the delimiter index comes off one `shrn` extract instead of
+# two extracts, an `orr`, a `cbz` and a `csel`. The hash is untouched and bit-identical.
+#
+# Counted with scripts/loopcount.py before the batch, integer = total - loads - stores - branches
+# - vector - transfers:
+#
+#                 insns/row   integer/row   measured vs v12
+#   v12               107.0          79.5                 —
+#   v19               105.0          73.0             -23 ms
+#   v20                95.5          70.5              -7 ms
+#   v21                91.5          56.5                 ?
+#
+# So v21 is -16.5 integer ops a row against v19's -6.5. Straight-lining v19's own rate gives
+# -58 ms, which nobody should believe: the loop still issues 13 loads a row and still waits on a
+# dependent table load, and one of those has to become the bound before the integer side runs out.
+# The honest prediction is a wide -20 to -55.
+#
+# What each outcome means. Near -50: the rate is real, the model generalises, and the remaining
+# integer work in the *parser* is the next target on the same argument. Near -20: there is a rate
+# but it is sublinear, and the batch after this one should find the new bound rather than move
+# more work. Near zero: v19 was not a rate at all and its 23 ms needs a different explanation,
+# because this change is strictly more of the same thing.
+#
+# REPS=7, matching the v20 batch. v19 and v21 are each entered twice under two labels at 18
+# threads; those two spreads are the batch's noise floor and nothing smaller may be read.
+v12 t18	OBRC_THREADS=18 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t18	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v21 t18	OBRC_THREADS=18 ./target/release/v21_vmask measurements.txt >/dev/null
+v19 t18 (dup)	OBRC_THREADS=18 ./target/release/v19_vecscan measurements.txt >/dev/null
+v21 t18 (dup)	OBRC_THREADS=18 ./target/release/v21_vmask measurements.txt >/dev/null
+v12 t8	OBRC_THREADS=8 ./target/release/v12_pairs measurements.txt >/dev/null
+v19 t8	OBRC_THREADS=8 ./target/release/v19_vecscan measurements.txt >/dev/null
+v21 t8	OBRC_THREADS=8 ./target/release/v21_vmask measurements.txt >/dev/null
